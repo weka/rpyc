@@ -21,7 +21,7 @@ retry_errnos = (errno.EAGAIN, errno.EWOULDBLOCK)
 class Stream(object):
     """Base Stream"""
 
-    __slots__ = ()
+    __slots__ = ('_selector',)
     def close(self):
         """closes the stream, releasing any system resources associated with it"""
         raise NotImplementedError()
@@ -32,27 +32,39 @@ class Stream(object):
     def fileno(self):
         """returns the stream's file descriptor"""
         raise NotImplementedError()
-    def poll(self, timeout):
+
+    def poll(self, timeout=30):
         """indicates whether the stream has data to read (within *timeout*
         seconds)"""
         try:
-            while True:
-                try:
-                    rl, _, _ = select([self], [], [], timeout)
-                except select_error:
-                    ex = sys.exc_info()[1]
-                    if ex.args[0] == errno.EINTR:
-                        continue
+            from selectors import DefaultSelector, EVENT_READ
+        except ImportError:
+            # Pre Python 3.4 implementation
+            try:
+                while True:
+                    try:
+                        rl, _, _ = select([self], [], [], timeout)
+                    except select_error:
+                        ex = sys.exc_info()[1]
+                        if ex.args[0] == errno.EINTR:
+                            continue
+                        else:
+                            raise
                     else:
-                        raise
-                else:
-                    break
-        except ValueError:
-            # i get this some times: "ValueError: file descriptor cannot be a negative integer (-1)"
-            # let's translate it to select.error
-            ex = sys.exc_info()[1]
-            raise select_error(str(ex))
-        return bool(rl)
+                        return bool(rl)
+            except ValueError:
+                # i get this some times: "ValueError: file descriptor cannot be a negative integer (-1)"
+                # let's translate it to select.error
+                ex = sys.exc_info()[1]
+                raise select_error(str(ex))
+
+        else:
+            # Python 3.4 implementation
+            if not hasattr(self, "_selector"):
+                self._selector = DefaultSelector()
+                self._selector.register(self, EVENT_READ, 0)
+            return bool(self._selector.select(timeout))
+
     def read(self, count):
         """reads **exactly** *count* bytes, or raise EOFError
 

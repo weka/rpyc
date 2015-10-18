@@ -10,7 +10,7 @@ class Build(cli.Application):
     def main(self):
         delete("build", "dist", "MANIFEST", local.cwd // "*.egg-info")
 
-        # generate zip, tar.gz, and win32 installer
+        # generate zip, tar.gz, and win32 installer 
         if self.publish:
             print("registering...")
             local.python("setup.py", "register")

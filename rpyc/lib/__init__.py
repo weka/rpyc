@@ -38,5 +38,5 @@ def setup_logger(quiet = False, logfile = None):
         opts['level'] = logging.DEBUG
     if logfile:
         opts['file'] = logfile
-    logging.basicConfig(**opts)
 
+    logging.basicConfig(format="%(asctime)s|%(threadName)-25s|%(name)-30s|%(levelname)-5s|%(funcName)-30s |%(message)s", **opts)

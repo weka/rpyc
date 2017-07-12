@@ -49,7 +49,8 @@ def setup_logger(quiet=False, logfile=None):
         opts['level'] = logging.DEBUG
     if logfile:
         opts['file'] = logfile
-    logging.basicConfig(format="%(asctime)s|%(threadName)-25s|%(name)-30s|%(levelname)-5s|%(funcName)-30s |%(message)s", **opts)
+    log_format = "%(asctime)s|%(threadName)-25s|%(name)-30s|%(levelname)-5s|%(funcName)-30s |%(message)s"
+    logging.basicConfig(format=log_format, **opts)
 
     max_size = 50 * 1024 * 1024  # 50 MB
     formatter = logging.Formatter(fmt=log_format)

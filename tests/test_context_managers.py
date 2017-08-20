@@ -38,8 +38,8 @@ class TestContextManagers(unittest.TestCase):
             self.assertFalse(service.on_context_exc)
             self.assertFalse(service.on_context_exit)
             self.assertEqual(x, 20)
-        self.assertFalse(service.on_context_exc)
-        self.assertTrue(service.on_context_exit)
+       self.assertFalse(service.on_context_exc)
+       self.assertTrue(service.on_context_exit)
 
     def test_context_exception(self):
         class MyException(Exception):
@@ -59,6 +59,16 @@ class TestContextManagers(unittest.TestCase):
         self.assertTrue(service.on_context_exc)
         self.assertTrue(service.on_context_exit)
 
+    def test_context_exception(self):
+        with self.assertRaises(AssertionError):
+            with self.conn.root.context(3):
+                self.assertTrue(on_context_enter)
+                self.assertFalse(on_context_exc)
+                self.assertFalse(on_context_exit)
+                assert False
+        self.assertTrue(on_context_exc)
+        self.assertTrue(on_context_exit)
+        print( "got past on_context_exit" )
 
 if __name__ == "__main__":
     unittest.main()

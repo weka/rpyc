@@ -6,14 +6,19 @@ from contextlib import contextmanager
 
 on_context_enter = False
 on_context_exit = False
+on_context_exc = False
+
 
 class MyService(rpyc.Service):
     @contextmanager
     def exposed_context(self, y):
-        global on_context_enter, on_context_exit
+        global on_context_enter, on_context_exit, on_context_exc
         on_context_enter = True
         try:
             yield 17 + y
+        except:
+            on_context_exc = True
+            raise
         finally:
             on_context_exit = True
 
@@ -24,18 +29,30 @@ class TestContextManagers(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-    
+
     def test_context(self):
         with self.conn.root.context(3) as x:
             print( "entering test" )
             self.assertTrue(on_context_enter)
+            self.assertFalse(on_context_exc)
             self.assertFalse(on_context_exit)
             print( "got past context enter" )
             self.assertEqual(x, 20)
             print( "got past x=20" )
+        self.assertFalse(on_context_exc)
         self.assertTrue(on_context_exit)
         print( "got past on_context_exit" )
 
+    def test_context_exception(self):
+        with self.assertRaises(AssertionError):
+            with self.conn.root.context(3):
+                self.assertTrue(on_context_enter)
+                self.assertFalse(on_context_exc)
+                self.assertFalse(on_context_exit)
+                assert False
+        self.assertTrue(on_context_exc)
+        self.assertTrue(on_context_exit)
+        print( "got past on_context_exit" )
 
 if __name__ == "__main__":
     unittest.main()

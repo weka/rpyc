@@ -9,6 +9,7 @@ import threading
 import time
 import random
 from rpyc.lib.compat import maxint  # noqa: F401
+import logging.handlers
 
 
 class MissingModule(object):
@@ -42,14 +43,15 @@ def safe_import(name):
 
 
 def setup_logger(quiet=False, logfile=None):
-    opts = {}
-    if quiet:
-        opts['level'] = logging.ERROR
-    else:
-        opts['level'] = logging.DEBUG
+    log_format = "%(asctime)s|%(threadName)-25s|%(name)-30s|%(levelname)-5s|%(funcName)-30s |%(message)s"
+    log_level = logging.ERROR if quiet else logging.DEBUG
+    logging.basicConfig(format=log_format, level=log_level)
     if logfile:
-        opts['filename'] = logfile
-    logging.basicConfig(format="%(asctime)s|%(threadName)-25s|%(name)-30s|%(levelname)-5s|%(funcName)-30s |%(message)s", **opts)
+        max_size = 50 * 1024 * 1024  # 50 MB
+        formatter = logging.Formatter(fmt=log_format)
+        rotating_file_handler = logging.handlers.RotatingFileHandler(logfile, maxBytes=max_size, backupCount=1)
+        rotating_file_handler.setFormatter(formatter)
+        logging.root.addHandler(rotating_file_handler)
 
 
 class hybridmethod(object):

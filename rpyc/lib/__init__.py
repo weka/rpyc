@@ -51,6 +51,12 @@ def setup_logger(quiet=False, logfile=None):
         opts['file'] = logfile
     logging.basicConfig(format="%(asctime)s|%(threadName)-25s|%(name)-30s|%(levelname)-5s|%(funcName)-30s |%(message)s", **opts)
 
+    max_size = 50 * 1024 * 1024  # 50 MB
+    formatter = logging.Formatter(fmt=log_format)
+    rotating_file_handler = logging.handlers.RotatingFileHandler(logfile, maxBytes=max_size, backupCount=1)
+    rotating_file_handler.setFormatter(formatter)
+    logging.root.addHandler(rotating_file_handler)
+
 
 class hybridmethod(object):
     """Decorator for hybrid instance/class methods that will act like a normal

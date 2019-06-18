@@ -451,8 +451,7 @@ class Connection(object):
         :raises: any exception that the requets may be generated
         :returns: the result of the request
         """
-        timeout = self._config["sync_request_timeout"]
-        return self.async_request(handler, *args, timeout=timeout).value
+        return self.async_request(handler, *args).value
 
     def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
         seq = self._get_seq_id()

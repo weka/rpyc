@@ -1,4 +1,4 @@
-from __future__ import with_statement 
+from __future__ import with_statement
 import unittest
 import sys
 from plumbum import SshMachine
@@ -11,30 +11,30 @@ class TestDeploy(unittest.TestCase):
         SshMachine.python = rem[sys.executable]
         with DeployedServer(rem) as dep:
             conn = dep.classic_connect()
-            print (conn.modules.sys)
+            print(conn.modules.sys)
             func = conn.modules.os.getcwd
-            print (func())
-        
+            print(func())
+
         try:
             func()
         except EOFError:
             pass
         else:
             self.fail("expected an EOFError")
-    
+
     def test_deploy_paramiko(self):
         try:
             import paramiko     # @UnusedImport
         except Exception:
             self.skipTest("Paramiko is not available")
         from plumbum.machines.paramiko_machine import ParamikoMachine
-        
-        rem = ParamikoMachine("localhost", missing_host_policy = paramiko.AutoAddPolicy())
+
+        rem = ParamikoMachine("localhost", missing_host_policy=paramiko.AutoAddPolicy())
         with DeployedServer(rem) as dep:
             conn = dep.classic_connect()
-            print (conn.modules.sys)
+            print(conn.modules.sys)
             func = conn.modules.os.getcwd
-            print (func())
+            print(func())
 
         try:
             func()

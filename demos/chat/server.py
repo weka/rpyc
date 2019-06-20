@@ -1,13 +1,13 @@
 from __future__ import with_statement
-from rpyc import Service, async
+from rpyc import Service, async_
 from rpyc.utils.server import ThreadedServer
 from threading import RLock
 
 
 USERS_DB = {
-    "foo" : "bar",
-    "spam" : "bacon",
-    "eggs" : "viking",
+    "foo": "bar",
+    "spam": "bacon",
+    "eggs": "viking",
 }
 broadcast_lock = RLock()
 tokens = set()
@@ -41,16 +41,16 @@ class UserToken(object):
             for tok in tokens:
                 try:
                     tok.callback(text)
-                except:
+                except Exception:
                     stale.add(tok)
             tokens -= stale
 
 
 class ChatService(Service):
-    def on_connect(self):
+    def on_connect(self, conn):
         self.token = None
 
-    def on_disconnect(self):
+    def on_disconnect(self, conn):
         if self.token:
             self.token.exposed_logout()
 
@@ -65,6 +65,5 @@ class ChatService(Service):
 
 
 if __name__ == "__main__":
-    t = ThreadedServer(ChatService, port = 19912)
+    t = ThreadedServer(ChatService, port=19912)
     t.start()
-

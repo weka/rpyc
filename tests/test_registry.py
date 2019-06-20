@@ -1,7 +1,7 @@
 import time
 import unittest
 
-from threading import Thread
+import rpyc
 from rpyc.utils.registry import TCPRegistryServer, TCPRegistryClient
 from rpyc.utils.registry import UDPRegistryServer, UDPRegistryClient
 
@@ -19,10 +19,7 @@ class BaseRegistryTest(object):
     def setUp(self):
         self.server = self._get_server()
         self.server.logger.quiet = True
-        self.server_thread = Thread(target=self.server.start)
-        self.server_thread.setDaemon(True)
-        self.server_thread.start()
-        time.sleep(0.1)
+        self.server_thread = rpyc.spawn(self.server.start)
 
     def tearDown(self):
         self.server.close()
@@ -45,7 +42,7 @@ class BaseRegistryTest(object):
         c = self._get_client()
         c.logger.quiet = True
         c.register(("BAR",), 17171)
-        
+
         time.sleep(1)
         res = c.discover("BAR")
         self.assertEqual(set(p for _, p in res), set((17171,)))
@@ -62,6 +59,7 @@ class TestTcpRegistry(BaseRegistryTest, unittest.TestCase):
     def _get_client(self):
         return TCPRegistryClient("localhost")
 
+
 class TestUdpRegistry(BaseRegistryTest, unittest.TestCase):
     def _get_server(self):
         return UDPRegistryServer(pruning_timeout=PRUNING_TIMEOUT)
@@ -72,5 +70,3 @@ class TestUdpRegistry(BaseRegistryTest, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

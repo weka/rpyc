@@ -5,50 +5,52 @@ import sys
 import os
 import socket
 import time
-import threading
+import threading  # noqa: F401
 import errno
 import logging
+from contextlib import closing
 try:
     import Queue
 except ImportError:
     import queue as Queue
-from rpyc.core import SocketStream, Channel, Connection
+from rpyc.core import SocketStream, Channel
 from rpyc.utils.registry import UDPRegistryClient
 from rpyc.utils.authenticators import AuthenticationError
-from rpyc.lib import safe_import
+from rpyc.lib import safe_import, spawn, spawn_waitready
 from rpyc.lib.compat import poll, get_exc_errno
 signal = safe_import("signal")
-
+gevent = safe_import("gevent")
 
 
 class Server(object):
     """Base server implementation
-    
-    :param service: the :class:`service <service.Service>` to expose
-    :param hostname: the host to bind to. Default is IPADDR_ANY, but you may 
+
+    :param service: the :class:`~rpyc.core.service.Service` to expose
+    :param hostname: the host to bind to. Default is IPADDR_ANY, but you may
                      want to restrict it only to ``localhost`` in some setups
     :param ipv6: whether to create an IPv6 or IPv4 socket. The default is IPv4
     :param port: the TCP port to bind to
     :param backlog: the socket's backlog (passed to ``listen()``)
-    :param reuse_addr: whether or not to create the socket with the ``SO_REUSEADDR`` option set. 
-    :param authenticator: the :ref:`api-authenticators` to use. If ``None``, no authentication 
+    :param reuse_addr: whether or not to create the socket with the ``SO_REUSEADDR`` option set.
+    :param authenticator: the :ref:`api-authenticators` to use. If ``None``, no authentication
                           is performed.
-    :param registrar: the :class:`registrar <rpyc.utils.registry.RegistryClient>` to use. 
-                          If ``None``, a default :class:`rpyc.utils.registry.UDPRegistryClient`
+    :param registrar: the :class:`~rpyc.utils.registry.RegistryClient` to use.
+                          If ``None``, a default :class:`~rpyc.utils.registry.UDPRegistryClient`
                           will be used
-    :param auto_register: whether or not to register using the *registrar*. By default, the 
-                          server will attempt to register only if a registrar was explicitly given. 
-    :param protocol_config: the :data:`configuration dictionary <rpyc.core.protocol.DEFAULT_CONFIG>` 
+    :param auto_register: whether or not to register using the *registrar*. By default, the
+                          server will attempt to register only if a registrar was explicitly given.
+    :param protocol_config: the :data:`configuration dictionary <rpyc.core.protocol.DEFAULT_CONFIG>`
                             that is passed to the RPyC connection
-    :param logger: the ``logger`` to use (of the built-in ``logging`` module). If ``None``, a 
+    :param logger: the ``logger`` to use (of the built-in ``logging`` module). If ``None``, a
                    default logger will be created.
     :param listener_timeout: the timeout of the listener socket; set to ``None`` to disable (e.g.
                              on embedded platforms with limited battery)
     """
-    
-    def __init__(self, service, hostname = "", ipv6 = False, port = 0, 
-            backlog = 10, reuse_addr = True, authenticator = None, registrar = None,
-            auto_register = None, protocol_config = {}, logger = None, listener_timeout = 0.5):
+
+    def __init__(self, service, hostname="", ipv6=False, port=0,
+                 backlog=socket.SOMAXCONN, reuse_addr=True, authenticator=None, registrar=None,
+                 auto_register=None, protocol_config={}, logger=None, listener_timeout=0.5,
+                 socket_path=None):
         self.active = False
         self._closed = False
         self.service = service
@@ -61,38 +63,46 @@ class Server(object):
         self.protocol_config = protocol_config
         self.clients = set()
 
-        if ipv6:
-            if hostname == "localhost" and sys.platform != "win32":
-                # on windows, you should bind to localhost even for ipv6
-                hostname = "localhost6"
-            self.listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        if socket_path is not None:
+            if hostname != "" or port != 0 or ipv6 is not False:
+                raise ValueError("socket_path is mutually exclusive with: hostname, port, ipv6")
+            self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener.bind(socket_path)
+            # set the self.port to the path as it's used for the registry and logging
+            self.host, self.port = "", socket_path
         else:
-            self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        if reuse_addr and sys.platform != "win32":
-            # warning: reuseaddr is not what you'd expect on windows!
-            # it allows you to bind an already bound port, resulting in "unexpected behavior"
-            # (quoting MSDN)
-            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if ipv6:
+                if hostname == "localhost" and sys.platform != "win32":
+                    # on windows, you should bind to localhost even for ipv6
+                    hostname = "localhost6"
+                self.listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            else:
+                self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-        self.listener.bind((hostname, port))
-        self.listener.settimeout(listener_timeout)
+            if reuse_addr and sys.platform != "win32":
+                # warning: reuseaddr is not what you'd expect on windows!
+                # it allows you to bind an already bound port, resulting in
+                # "unexpected behavior" (quoting MSDN)
+                self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # hack for IPv6 (the tuple can be longer than 2)
-        sockname = self.listener.getsockname()
-        self.host, self.port = sockname[0], sockname[1]
+            self.listener.bind((hostname, port))
+            self.listener.settimeout(listener_timeout)
+
+            # hack for IPv6 (the tuple can be longer than 2)
+            sockname = self.listener.getsockname()
+            self.host, self.port = sockname[0], sockname[1]
 
         if logger is None:
-            logger = logging.getLogger("%s/%d" % (self.service.get_service_name(), self.port))
+            logger = logging.getLogger("%s/%s" % (self.service.get_service_name(), self.port))
         self.logger = logger
         if "logger" not in self.protocol_config:
             self.protocol_config["logger"] = self.logger
         if registrar is None:
-            registrar = UDPRegistryClient(logger = self.logger)
+            registrar = UDPRegistryClient(logger=self.logger)
         self.registrar = registrar
 
     def close(self):
-        """Closes (terminates) the server and all of its clients. If applicable, 
+        """Closes (terminates) the server and all of its clients. If applicable,
         also unregisters from the registry server"""
         if self._closed:
             return
@@ -141,7 +151,7 @@ class Server(object):
             return
 
         sock.setblocking(True)
-        self.logger.info("accepted %s:%s", addrinfo[0], addrinfo[1])
+        self.logger.info("accepted %s with fd %s", addrinfo, sock.fileno())
         self.clients.add(sock)
         self._accept_method(sock)
 
@@ -156,15 +166,13 @@ class Server(object):
         try:
             if self.authenticator:
                 addrinfo = sock.getpeername()
-                h = addrinfo[0]
-                p = addrinfo[1]
                 try:
                     sock2, credentials = self.authenticator(sock)
                 except AuthenticationError:
-                    self.logger.info("[%s]:%s failed to authenticate, rejecting connection", h, p)
+                    self.logger.info("%s failed to authenticate, rejecting connection", addrinfo)
                     return
                 else:
-                    self.logger.info("[%s]:%s authenticated successfully", h, p)
+                    self.logger.info("%s authenticated successfully", addrinfo)
             else:
                 credentials = None
                 sock2 = sock
@@ -183,26 +191,26 @@ class Server(object):
 
     def _serve_client(self, sock, credentials):
         addrinfo = sock.getpeername()
-        h = addrinfo[0]
-        p = addrinfo[1]
         if credentials:
-            self.logger.info("welcome [%s]:%s (%r)", h, p, credentials)
+            self.logger.info("welcome %s (%r)", addrinfo, credentials)
         else:
-            self.logger.info("welcome [%s]:%s", h, p)
+            self.logger.info("welcome %s", addrinfo)
         try:
-            config = dict(self.protocol_config, credentials = credentials, 
-                endpoints = (sock.getsockname(), addrinfo), logger = self.logger)
-            conn = Connection(self.service, Channel(SocketStream(sock)),
-                config = config, _lazy = True)
-            conn._init_service()
-            conn.serve_all()
+            config = dict(self.protocol_config, credentials=credentials,
+                          endpoints=(sock.getsockname(), addrinfo), logger=self.logger)
+            conn = self.service._connect(Channel(SocketStream(sock)), config)
+            self._handle_connection(conn)
         finally:
-            self.logger.info("goodbye [%s]:%s", h, p)
+            self.logger.info("goodbye %s", addrinfo)
+
+    def _handle_connection(self, conn):
+        """This methoed should implement the server's logic."""
+        conn.serve_all()
 
     def _bg_register(self):
         interval = self.registrar.REREGISTER_INTERVAL
         self.logger.info("started background auto-register thread "
-            "(interval = %s)", interval)
+                         "(interval = %s)", interval)
         tnext = 0
         try:
             while self.active:
@@ -211,7 +219,7 @@ class Server(object):
                     did_register = False
                     aliases = self.service.get_service_aliases()
                     try:
-                        did_register = self.registrar.register(aliases, self.port, interface = self.host)
+                        did_register = self.registrar.register(aliases, self.port, interface=self.host)
                     except Exception:
                         self.logger.exception("error registering services")
 
@@ -227,20 +235,33 @@ class Server(object):
             if not self._closed:
                 self.logger.info("background auto-register thread finished")
 
-    def start(self):
-        """Starts the server (blocking). Use :meth:`close` to stop"""
+    def _listen(self):
+        if self.active:
+            return
         self.listener.listen(self.backlog)
+        # On Jython, if binding to port 0, we can get the correct port only
+        # once `listen()` was called, see #156:
+        if not self.port:
+            # Note that for AF_UNIX the following won't work (but we are safe
+            # since we already saved the socket_path into self.port):
+            self.port = self.listener.getsockname()[1]
         self.logger.info("server started on [%s]:%s", self.host, self.port)
         self.active = True
+
+    def _register(self):
         if self.auto_register:
-            t = threading.Thread(target = self._bg_register)
-            t.setDaemon(True)
-            t.start()
+            self.auto_register = False
+            spawn(self._bg_register)
+
+    def start(self):
+        """Starts the server (blocking). Use :meth:`close` to stop"""
+        self._listen()
+        self._register()
         try:
             while self.active:
                 self.accept()
         except EOFError:
-            pass # server closed by another thread
+            pass  # server closed by another thread
         except KeyboardInterrupt:
             print("")
             self.logger.warn("keyboard interrupt!")
@@ -248,30 +269,37 @@ class Server(object):
             self.logger.info("server has terminated")
             self.close()
 
+    def _start_in_thread(self):
+        """
+        Start the server in a thread, returns when when server is listening and
+        ready to accept incoming connections.
+
+        Used for testing, API could change anytime! Do not use!"""
+        return spawn_waitready(self._listen, self.start)[0]
+
 
 class OneShotServer(Server):
     """
     A server that handles a single connection (blockingly), and terminates after that
-    
+
     Parameters: see :class:`Server`
     """
+
     def _accept_method(self, sock):
-        try:
+        with closing(sock):
             self._authenticate_and_serve_client(sock)
-        finally:
-            self.close()
+
 
 class ThreadedServer(Server):
     """
     A server that spawns a thread for each connection. Works on any platform
     that supports threads.
-    
+
     Parameters: see :class:`Server`
     """
+
     def _accept_method(self, sock):
-        t = threading.Thread(target = self._authenticate_and_serve_client, args = (sock,))
-        t.setDaemon(True)
-        t.start()
+        spawn(self._authenticate_and_serve_client, sock)
 
 
 class ThreadPoolServer(Server):
@@ -282,7 +310,7 @@ class ThreadPoolServer(Server):
     up to request_batch_size requests from the same connection in one go, before it goes to
     the next connection with pending requests. By default, self.request_batch_size
     is set to 10 and it can be overwritten in the constructor arguments.
-    
+
     Contributed by *@sponce*
 
     Parameters: see :class:`Server`
@@ -291,38 +319,30 @@ class ThreadPoolServer(Server):
     def __init__(self, *args, **kwargs):
         '''Initializes a ThreadPoolServer. In particular, instantiate the thread pool.'''
         # get the number of threads in the pool
-        nbthreads = 20
-        if 'nbThreads' in kwargs:
-            nbthreads = kwargs['nbThreads']
-            del kwargs['nbThreads']
-        # get the request batch size
-        self.request_batch_size = 10
-        if 'requestBatchSize' in kwargs:
-            self.request_batch_size = kwargs['requestBatchSize']
-            del kwargs['requestBatchSize']
+        self.nbthreads = kwargs.pop('nbThreads', 20)
+        self.request_batch_size = kwargs.pop('requestBatchSize', 10)
         # init the parent
         Server.__init__(self, *args, **kwargs)
-        # a queue of connections having somethign to process
+        # a queue of connections having something to process
         self._active_connection_queue = Queue.Queue()
-        # declare the pool as already active
-        self.active = True
-        # setup the thread pool for handling requests
-        self.workers = []
-        for _ in range(nbthreads):
-            t = threading.Thread(target = self._serve_clients)
-            t.setName('ThreadPoolWorker')
-            t.daemon = True
-            t.start()
-            self.workers.append(t)
-        # a polling object to be used be the polling thread
-        self.poll_object = poll()
         # a dictionary fd -> connection
         self.fd_to_conn = {}
+        # a polling object to be used be the polling thread
+        self.poll_object = poll()
+
+    def _listen(self):
+        if self.active:
+            return
+        super(ThreadPoolServer, self)._listen()
+        # setup the thread pool for handling requests
+        self.workers = []
+        for i in range(self.nbthreads):
+            t = spawn(self._serve_clients)
+            t.setName('Worker%i' % i)
+            self.workers.append(t)
         # setup a thread for polling inactive connections
-        self.polling_thread = threading.Thread(target = self._poll_inactive_clients)
+        self.polling_thread = spawn(self._poll_inactive_clients)
         self.polling_thread.setName('PollingThread')
-        self.polling_thread.setDaemon(True)
-        self.polling_thread.start()
 
     def close(self):
         '''closes a ThreadPoolServer. In particular, joins the thread pool.'''
@@ -348,6 +368,8 @@ class ThreadPoolServer(Server):
 
     def _drop_connection(self, fd):
         '''removes a connection by closing it and removing it from internal structs'''
+        conn = None
+
         # cleanup fd_to_conn dictionnary
         try:
             conn = self.fd_to_conn[fd]
@@ -355,8 +377,11 @@ class ThreadPoolServer(Server):
         except KeyError:
             # the active connection has already been removed
             pass
+
         # close connection
-        conn.close()
+        self.logger.info("Closing connection for fd %d", fd)
+        if conn:
+            conn.close()
 
     def _add_inactive_connection(self, fd):
         '''adds a connection to the set of inactive ones'''
@@ -384,15 +409,15 @@ class ThreadPoolServer(Server):
         Check whether inactive clients have become active'''
         while self.active:
             try:
-                # the actual poll, with a timeout of 1s so that we can exit in case
+                # the actual poll, with a timeout of 0.1s so that we can exit in case
                 # we re not active anymore
-                active_clients = self.poll_object.poll(1)
+                active_clients = self.poll_object.poll(0.1)
                 # for each client that became active, put them in the active queue
                 self._handle_poll_result(active_clients)
             except Exception:
                 ex = sys.exc_info()[1]
                 # "Caught exception in Worker thread" message
-                self.logger.warning("failed to poll clients, caught exception : %s", str(ex))
+                self.logger.warning("Failed to poll clients, caught exception : %s", str(ex))
                 # wait a bit so that we do not loop too fast in case of error
                 time.sleep(0.2)
 
@@ -401,7 +426,7 @@ class ThreadPoolServer(Server):
         # serve a maximum of RequestBatchSize requests for this connection
         for _ in range(self.request_batch_size):
             try:
-                if not self.fd_to_conn[fd].poll(): # note that poll serves the request
+                if not self.fd_to_conn[fd].poll():  # note that poll serves the request
                     # we could not find a request, so we put this connection back to the inactive set
                     self._add_inactive_connection(fd)
                     return
@@ -434,9 +459,8 @@ class ThreadPoolServer(Server):
                 # thread can stop even if there is nothing in the queue
                 pass
             except Exception:
-                ex = sys.exc_info()[1]
                 # "Caught exception in Worker thread" message
-                self.logger.warning("failed to serve client, caught exception : %s", str(ex))
+                self.logger.exception("failed to serve client, caught exception")
                 # wait a bit so that we do not loop too fast in case of error
                 time.sleep(0.2)
 
@@ -446,44 +470,43 @@ class ThreadPoolServer(Server):
         changed if rpyc evolves'''
         # authenticate
         if self.authenticator:
-            h, p = sock.getpeername()
-            try:
-                sock, credentials = self.authenticator(sock)
-            except AuthenticationError:
-                self.logger.info("%s:%s failed to authenticate, rejecting connection", h, p)
-                return None
+            sock, credentials = self.authenticator(sock)
         else:
             credentials = None
         # build a connection
         h, p = sock.getpeername()
-        config = dict(self.protocol_config, credentials=credentials, connid="%s:%d"%(h, p))
-        return Connection(self.service, Channel(SocketStream(sock)), config=config)
+        config = dict(self.protocol_config, credentials=credentials, connid="%s:%d" % (h, p),
+                      endpoints=(sock.getsockname(), (h, p)))
+        return sock, self.service._connect(Channel(SocketStream(sock)), config)
 
     def _accept_method(self, sock):
         '''Implementation of the accept method : only pushes the work to the internal queue.
         In case the queue is full, raises an AsynResultTimeout error'''
         try:
+            h, p = None, None
             # authenticate and build connection object
-            conn = self._authenticate_and_build_connection(sock)
+            sock, conn = self._authenticate_and_build_connection(sock)
             # put the connection in the active queue
-            if conn:
-                fd = conn.fileno()
-                self.fd_to_conn[fd] = conn
-                self._add_inactive_connection(fd)
-                self.clients.clear()
+            h, p = sock.getpeername()
+            fd = conn.fileno()
+            self.logger.debug("Created connection to %s:%d with fd %d", h, p, fd)
+            self.fd_to_conn[fd] = conn
+            self._add_inactive_connection(fd)
+            self.clients.clear()
         except Exception:
-            ex = sys.exc_info()[1]
-            self.logger.warning("failed to serve client, caught exception : %s", str(ex))
+            err_msg = "Failed to serve client for {}:{}, caught exception".format(h, p)
+            self.logger.exception(err_msg)
+            sock.close()
 
 
 class ForkingServer(Server):
     """
-    A server that forks a child process for each connection. Available on 
+    A server that forks a child process for each connection. Available on
     POSIX compatible systems only.
-    
+
     Parameters: see :class:`Server`
     """
-    
+
     def __init__(self, *args, **kwargs):
         if not signal:
             raise OSError("ForkingServer not supported on this platform")
@@ -514,12 +537,12 @@ class ForkingServer(Server):
             try:
                 self.logger.debug("child process created")
                 signal.signal(signal.SIGCHLD, self._prevhandler)
-                #76: call signal.siginterrupt(False) in forked child
+                # 76: call signal.siginterrupt(False) in forked child
                 signal.siginterrupt(signal.SIGCHLD, False)
                 self.listener.close()
                 self.clients.clear()
                 self._authenticate_and_serve_client(sock)
-            except:
+            except Exception:
                 self.logger.exception("child process terminated abnormally")
             else:
                 self.logger.debug("child process terminated")
@@ -529,4 +552,17 @@ class ForkingServer(Server):
         else:
             # parent
             sock.close()
+            self.clients.discard(sock)
 
+
+class GeventServer(Server):
+
+    """gevent based Server. Requires using ``gevent.monkey.patch_all()``."""
+
+    def _register(self):
+        if self.auto_register:
+            self.auto_register = False
+            gevent.spawn(self._bg_register)
+
+    def _accept_method(self, sock):
+        gevent.spawn(self._authenticate_and_serve_client, sock)

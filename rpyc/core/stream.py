@@ -5,14 +5,12 @@ consistent view of a *duplex byte stream*.
 import sys
 import os
 import socket
-import time
 import errno
-from rpyc.lib import safe_import
-from rpyc.lib.compat import poll, select_error, BYTES_LITERAL, get_exc_errno, maxint
+from rpyc.lib import safe_import, Timeout, socket_backoff_connect
+from rpyc.lib.compat import poll, select_error, BYTES_LITERAL, get_exc_errno, maxint  # noqa: F401
 win32file = safe_import("win32file")
 win32pipe = safe_import("win32pipe")
-msvcrt = safe_import("msvcrt")
-ssl = safe_import("ssl")
+win32event = safe_import("win32event")
 
 
 retry_errnos = (errno.EAGAIN, errno.EWOULDBLOCK)
@@ -22,25 +20,30 @@ class Stream(object):
     """Base Stream"""
 
     __slots__ = ()
+
     def close(self):
         """closes the stream, releasing any system resources associated with it"""
         raise NotImplementedError()
+
     @property
     def closed(self):
         """tests whether the stream is closed or not"""
         raise NotImplementedError()
+
     def fileno(self):
         """returns the stream's file descriptor"""
         raise NotImplementedError()
+
     def poll(self, timeout):
         """indicates whether the stream has data to read (within *timeout*
         seconds)"""
+        timeout = Timeout(timeout)
         try:
             p = poll()   # from lib.compat, it may be a select object on non-Unix platforms
             p.register(self.fileno(), "r")
             while True:
                 try:
-                    rl = p.poll(timeout)
+                    rl = p.poll(timeout.timeleft())
                 except select_error:
                     ex = sys.exc_info()[1]
                     if ex.args[0] == errno.EINTR:
@@ -57,6 +60,7 @@ class Stream(object):
             ex = sys.exc_info()[1]
             raise select_error(str(ex))
         return bool(rl)
+
     def read(self, count):
         """reads **exactly** *count* bytes, or raise EOFError
 
@@ -65,6 +69,7 @@ class Stream(object):
         :returns: read data
         """
         raise NotImplementedError()
+
     def write(self, data):
         """writes the entire *data*, or raise EOFError
 
@@ -72,21 +77,33 @@ class Stream(object):
         """
         raise NotImplementedError()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
 
 class ClosedFile(object):
     """Represents a closed file object (singleton)"""
     __slots__ = ()
+
     def __getattr__(self, name):
-        if name.startswith("__"): # issue 71
+        if name.startswith("__"):  # issue 71
             raise AttributeError("stream has been closed")
         raise EOFError("stream has been closed")
+
     def close(self):
         pass
+
     @property
     def closed(self):
         return True
+
     def fileno(self):
         raise EOFError("stream has been closed")
+
+
 ClosedFile = ClosedFile()
 
 
@@ -95,35 +112,40 @@ class SocketStream(Stream):
 
     __slots__ = ("sock",)
     MAX_IO_CHUNK = 8000
+
     def __init__(self, sock):
         self.sock = sock
 
     @classmethod
-    def _connect(cls, host, port, family = socket.AF_INET, socktype = socket.SOCK_STREAM,
-            proto = 0, timeout = 3, nodelay = False, keepalive = False):
+    def _connect(cls, host, port, family=socket.AF_INET, socktype=socket.SOCK_STREAM,
+                 proto=0, timeout=3, nodelay=False, keepalive=False, attempts=6):
         family, socktype, proto, _, sockaddr = socket.getaddrinfo(host, port, family,
-            socktype, proto)[0]
-        s = socket.socket(family, socktype, proto)
-        s.settimeout(timeout)
-        s.connect(sockaddr)
-        if nodelay:
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        if keepalive:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
-            if hasattr(socket, "TCP_KEEPIDLE") and hasattr(socket, "TCP_KEEPINTVL") and hasattr(socket, "TCP_KEEPCNT"):
+                                                                  socktype, proto)[0]
+        s = socket_backoff_connect(family, socktype, proto, sockaddr, timeout, attempts)
+        try:
+            if nodelay:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if keepalive:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 # Linux specific: after <keepalive> idle seconds, start sending keepalives every <keepalive> seconds.
-                # Drop connection after 5 failed keepalives
-                # `keepalive` may be a bool or an integer
-                if keepalive is True:
-                    keepalive = 60
-                if keepalive < 1:
-                    raise ValueError("Keepalive minimal value is 1 second")
+                is_linux_socket = hasattr(socket, "TCP_KEEPIDLE")
+                is_linux_socket &= hasattr(socket, "TCP_KEEPINTVL")
+                is_linux_socket &= hasattr(socket, "TCP_KEEPCNT")
+                if is_linux_socket:
+                    # Drop connection after 5 failed keepalives
+                    # `keepalive` may be a bool or an integer
+                    if keepalive is True:
+                        keepalive = 60
+                    if keepalive < 1:
+                        raise ValueError("Keepalive minimal value is 1 second")
 
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, keepalive)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, keepalive)
-        return s
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, keepalive)
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, keepalive)
+            return s
+        except BaseException:
+            s.close()
+            raise
 
     @classmethod
     def connect(cls, host, port, **kwargs):
@@ -150,6 +172,23 @@ class SocketStream(Stream):
         return cls(cls._connect(host, port, **kwargs))
 
     @classmethod
+    def unix_connect(cls, path, timeout=3):
+        """factory method that creates a ``SocketStream`` over a unix domain socket
+        located in *path*
+
+        :param path: the path to the unix domain socket
+        :param timeout: socket timeout
+        """
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(timeout)
+            s.connect(path)
+            return cls(s)
+        except BaseException:
+            s.close()
+            raise
+
+    @classmethod
     def ssl_connect(cls, host, port, ssl_kwargs, **kwargs):
         """factory method that creates a ``SocketStream`` over an SSL-wrapped
         socket, connected to *host* and *port* with the given credentials.
@@ -166,15 +205,21 @@ class SocketStream(Stream):
 
         :returns: a :class:`SocketStream`
         """
+        import ssl
         if kwargs.pop("ipv6", False):
             kwargs["family"] = socket.AF_INET6
         s = cls._connect(host, port, **kwargs)
-        s2 = ssl.wrap_socket(s, **ssl_kwargs)
-        return cls(s2)
+        try:
+            s2 = ssl.wrap_socket(s, **ssl_kwargs)
+            return cls(s2)
+        except BaseException:
+            s.close()
+            raise
 
     @property
     def closed(self):
         return self.sock is ClosedFile
+
     def close(self):
         if not self.closed:
             try:
@@ -183,6 +228,7 @@ class SocketStream(Stream):
                 pass
         self.sock.close()
         self.sock = ClosedFile
+
     def fileno(self):
         try:
             return self.sock.fileno()
@@ -214,6 +260,7 @@ class SocketStream(Stream):
             data.append(buf)
             count -= len(buf)
         return BYTES_LITERAL("").join(data)
+
     def write(self, data):
         try:
             while data:
@@ -224,27 +271,33 @@ class SocketStream(Stream):
             self.close()
             raise EOFError(ex)
 
+
 class TunneledSocketStream(SocketStream):
     """A socket stream over an SSH tunnel (terminates the tunnel when the connection closes)"""
 
     __slots__ = ("tun",)
+
     def __init__(self, sock):
         self.sock = sock
         self.tun = None
+
     def close(self):
         SocketStream.close(self)
         if self.tun:
             self.tun.close()
+
 
 class PipeStream(Stream):
     """A stream over two simplex pipes (one used to input, another for output)"""
 
     __slots__ = ("incoming", "outgoing")
     MAX_IO_CHUNK = 32000
+
     def __init__(self, incoming, outgoing):
         outgoing.flush()
         self.incoming = incoming
         self.outgoing = outgoing
+
     @classmethod
     def from_std(cls):
         """factory method that creates a PipeStream over the standard pipes
@@ -253,6 +306,7 @@ class PipeStream(Stream):
         :returns: a :class:`PipeStream` instance
         """
         return cls(sys.stdin, sys.stdout)
+
     @classmethod
     def create_pair(cls):
         """factory method that creates two pairs of anonymous pipes, and
@@ -265,16 +319,20 @@ class PipeStream(Stream):
         side1 = cls(os.fdopen(r1, "rb"), os.fdopen(w2, "wb"))
         side2 = cls(os.fdopen(r2, "rb"), os.fdopen(w1, "wb"))
         return side1, side2
+
     @property
     def closed(self):
         return self.incoming is ClosedFile
+
     def close(self):
         self.incoming.close()
         self.outgoing.close()
         self.incoming = ClosedFile
         self.outgoing = ClosedFile
+
     def fileno(self):
         return self.incoming.fileno()
+
     def read(self, count):
         data = []
         try:
@@ -292,6 +350,7 @@ class PipeStream(Stream):
             self.close()
             raise EOFError(ex)
         return BYTES_LITERAL("").join(data)
+
     def write(self, data):
         try:
             while data:
@@ -313,6 +372,7 @@ class Win32PipeStream(Stream):
     MAX_IO_CHUNK = 32000
 
     def __init__(self, incoming, outgoing):
+        import msvcrt
         self._keepalive = (incoming, outgoing)
         if hasattr(incoming, "fileno"):
             self._fileno = incoming.fileno()
@@ -321,9 +381,11 @@ class Win32PipeStream(Stream):
             outgoing = msvcrt.get_osfhandle(outgoing.fileno())
         self.incoming = incoming
         self.outgoing = outgoing
+
     @classmethod
     def from_std(cls):
         return cls(sys.stdin, sys.stdout)
+
     @classmethod
     def create_pair(cls):
         r1, w1 = win32pipe.CreatePipe(None, cls.PIPE_BUFFER_SIZE)
@@ -332,9 +394,11 @@ class Win32PipeStream(Stream):
 
     def fileno(self):
         return self._fileno
+
     @property
     def closed(self):
         return self.incoming is ClosedFile
+
     def close(self):
         if self.closed:
             return
@@ -348,6 +412,7 @@ class Win32PipeStream(Stream):
         except Exception:
             pass
         self.outgoing = ClosedFile
+
     def read(self, count):
         try:
             data = []
@@ -365,6 +430,7 @@ class Win32PipeStream(Stream):
             self.close()
             raise EOFError(ex)
         return BYTES_LITERAL("").join(data)
+
     def write(self, data):
         try:
             while data:
@@ -380,24 +446,21 @@ class Win32PipeStream(Stream):
             self.close()
             raise EOFError(ex)
 
-    def poll(self, timeout, interval = 0.1):
-        """a poor man's version of select()"""
-        if timeout is None:
-            timeout = maxint
-        length = 0
-        tmax = time.time() + timeout
+    def poll(self, timeout, interval=0.001):
+        """a Windows version of select()"""
+        timeout = Timeout(timeout)
         try:
-            while length == 0:
-                length = win32pipe.PeekNamedPipe(self.incoming, 0)[1]
-                if time.time() >= tmax:
-                    break
-                time.sleep(interval)
+            while True:
+                if win32pipe.PeekNamedPipe(self.incoming, 0)[1] != 0:
+                    return True
+                if timeout.expired():
+                    return False
+                timeout.sleep(interval)
         except TypeError:
             ex = sys.exc_info()[1]
             if not self.closed:
                 raise
             raise EOFError(ex)
-        return length != 0
 
 
 class NamedPipeStream(Win32PipeStream):
@@ -407,20 +470,28 @@ class NamedPipeStream(Win32PipeStream):
     NAMED_PIPE_PREFIX = r'\\.\pipe\rpyc_'
     PIPE_IO_TIMEOUT = 3
     CONNECT_TIMEOUT = 3
-    __slots__ = ("is_server_side",)
 
     def __init__(self, handle, is_server_side):
+        import pywintypes
         Win32PipeStream.__init__(self, handle, handle)
         self.is_server_side = is_server_side
+        self.read_overlapped = pywintypes.OVERLAPPED()
+        self.read_overlapped.hEvent = win32event.CreateEvent(None, 1, 1, None)
+        self.write_overlapped = pywintypes.OVERLAPPED()
+        self.write_overlapped.hEvent = win32event.CreateEvent(None, 1, 1, None)
+        self.poll_buffer = win32file.AllocateReadBuffer(1)
+        self.poll_read = False
+
     @classmethod
     def from_std(cls):
         raise NotImplementedError()
+
     @classmethod
     def create_pair(cls):
         raise NotImplementedError()
 
     @classmethod
-    def create_server(cls, pipename, connect = True):
+    def create_server(cls, pipename, connect=True):
         """factory method that creates a server-side ``NamedPipeStream``, over
         a newly-created *named pipe* of the given name.
 
@@ -435,8 +506,8 @@ class NamedPipeStream(Win32PipeStream):
             pipename = cls.NAMED_PIPE_PREFIX + pipename
         handle = win32pipe.CreateNamedPipe(
             pipename,
-            win32pipe.PIPE_ACCESS_DUPLEX,
-            win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
+            win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED,
+            win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE,
             1,
             cls.PIPE_BUFFER_SIZE,
             cls.PIPE_BUFFER_SIZE,
@@ -453,7 +524,8 @@ class NamedPipeStream(Win32PipeStream):
         until a connection arrives)"""
         if not self.is_server_side:
             raise ValueError("this must be the server side")
-        win32pipe.ConnectNamedPipe(self.incoming, None)
+        win32pipe.ConnectNamedPipe(self.incoming, self.write_overlapped)
+        win32event.WaitForSingleObject(self.write_overlapped.hEvent, win32event.INFINITE)
 
     @classmethod
     def create_client(cls, pipename):
@@ -474,7 +546,7 @@ class NamedPipeStream(Win32PipeStream):
             0,
             None,
             win32file.OPEN_EXISTING,
-            0,
+            win32file.FILE_FLAG_OVERLAPPED,
             None
         )
         return cls(handle, False)
@@ -485,9 +557,77 @@ class NamedPipeStream(Win32PipeStream):
         if self.is_server_side:
             win32file.FlushFileBuffers(self.outgoing)
             win32pipe.DisconnectNamedPipe(self.outgoing)
+
+        win32file.CloseHandle(self.read_overlapped.hEvent)
+        win32file.CloseHandle(self.write_overlapped.hEvent)
         Win32PipeStream.close(self)
+
+    def read(self, count):
+        try:
+            if self.poll_read:
+                win32file.GetOverlappedResult(self.incoming, self.read_overlapped, 1)
+                data = [self.poll_buffer[:]]
+                self.poll_read = False
+                count -= 1
+            else:
+                data = []
+            while count > 0:
+                hr, buf = win32file.ReadFile(self.incoming,
+                                             win32file.AllocateReadBuffer(int(min(self.MAX_IO_CHUNK, count))),
+                                             self.read_overlapped)
+                n = win32file.GetOverlappedResult(self.incoming, self.read_overlapped, 1)
+                count -= n
+                data.append(buf[:n])
+        except TypeError:
+            ex = sys.exc_info()[1]
+            if not self.closed:
+                raise
+            raise EOFError(ex)
+        except win32file.error:
+            ex = sys.exc_info()[1]
+            self.close()
+            raise EOFError(ex)
+        return BYTES_LITERAL("").join(data)
+
+    def write(self, data):
+        try:
+            while data:
+                dummy, count = win32file.WriteFile(self.outgoing, data[:self.MAX_IO_CHUNK], self.write_overlapped)
+                data = data[count:]
+        except TypeError:
+            ex = sys.exc_info()[1]
+            if not self.closed:
+                raise
+            raise EOFError(ex)
+        except win32file.error:
+            ex = sys.exc_info()[1]
+            self.close()
+            raise EOFError(ex)
+
+    def poll(self, timeout, interval=0.001):
+        """Windows version of select()"""
+        timeout = Timeout(timeout)
+        try:
+            if timeout.finite:
+                wait_time = int(max(1, timeout.timeleft() * 1000))
+            else:
+                wait_time = win32event.INFINITE
+
+            if not self.poll_read:
+                hr, self.poll_buffer = win32file.ReadFile(self.incoming,
+                                                          self.poll_buffer,
+                                                          self.read_overlapped)
+                self.poll_read = True
+                if hr == 0:
+                    return True
+            res = win32event.WaitForSingleObject(self.read_overlapped.hEvent, wait_time)
+            return res == win32event.WAIT_OBJECT_0
+        except TypeError:
+            ex = sys.exc_info()[1]
+            if not self.closed:
+                raise
+            raise EOFError(ex)
 
 
 if sys.platform == "win32":
-    PipeStream = Win32PipeStream
-
+    PipeStream = Win32PipeStream  # noqa: F811

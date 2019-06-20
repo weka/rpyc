@@ -1,27 +1,35 @@
-"""
-**NetRef**: a transparent *network reference*. This module contains quite a lot
+"""*NetRef*: a transparent *network reference*. This module contains quite a lot
 of *magic*, so beware.
 """
 import sys
-import inspect
 import types
-from rpyc.lib.compat import pickle, is_py3k, maxint
+from rpyc.lib import get_methods, get_id_pack
+from rpyc.lib.compat import pickle, is_py3k, maxint, with_metaclass
 from rpyc.core import consts
 
 
-_local_netref_attrs = frozenset([
-    '____conn__', '____oid__', '__class__', '__cmp__', '__del__', '__delattr__',
-    '__dir__', '__doc__', '__getattr__', '__getattribute__', '__hash__',
+builtin_id_pack_cache = {}  # name_pack -> id_pack
+builtin_classes_cache = {}  # id_pack -> class
+# If these can be accessed, numpy will try to load the array from local memory,
+# resulting in exceptions and/or segfaults, see #236:
+DELETED_ATTRS = frozenset([
+    '__array_struct__', '__array_interface__',
+])
+
+LOCAL_ATTRS = frozenset([
+    '____conn__', '____id_pack__', '____refcount__', '__class__', '__cmp__', '__del__', '__delattr__',
+    '__dir__', '__doc__', '__getattr__', '__getattribute__', '__hash__', '__instancecheck__',
     '__init__', '__metaclass__', '__module__', '__new__', '__reduce__',
     '__reduce_ex__', '__repr__', '__setattr__', '__slots__', '__str__',
-    '__weakref__', '__dict__', '__members__', '__methods__', '__exit__',
-])
+    '__weakref__', '__dict__', '__methods__', '__exit__',
+    '__eq__', '__ne__', '__lt__', '__gt__', '__le__', '__ge__',
+]) | DELETED_ATTRS
 """the set of attributes that are local to the netref object"""
 
 _builtin_types = [
-    type, object, bool, complex, dict, float, int, list, slice, str, tuple, set, 
+    type, object, bool, complex, dict, float, int, list, slice, str, tuple, set,
     frozenset, Exception, type(None), types.BuiltinFunctionType, types.GeneratorType,
-    types.MethodType, types.CodeType, types.FrameType, types.TracebackType, 
+    types.MethodType, types.CodeType, types.FrameType, types.TracebackType,
     types.ModuleType, types.FunctionType,
 
     type(int.__add__),      # wrapper_descriptor
@@ -43,86 +51,89 @@ if is_py3k:
     _builtin_types.extend([
         bytes, bytearray, type(iter(range(10))), memoryview,
     ])
+    xrange = range
 else:
     _builtin_types.extend([
-        basestring, unicode, long, xrange, type(iter(xrange(10))), file,
+        basestring, unicode, long, xrange, type(iter(xrange(10))), file,  # noqa
         types.InstanceType, types.ClassType, types.DictProxyType,
     ])
+_normalized_builtin_types = {}
 
-_normalized_builtin_types = dict(((t.__name__, t.__module__), t)
-    for t in _builtin_types)
 
 def syncreq(proxy, handler, *args):
     """Performs a synchronous request on the given proxy object.
     Not intended to be invoked directly.
-    
+
     :param proxy: the proxy on which to issue the request
-    :param handler: the request handler (one of the ``HANDLE_XXX`` members of 
+    :param handler: the request handler (one of the ``HANDLE_XXX`` members of
                     ``rpyc.protocol.consts``)
     :param args: arguments to the handler
-    
+
     :raises: any exception raised by the operation will be raised
     :returns: the result of the operation
     """
-    conn = object.__getattribute__(proxy, "____conn__")()
-    if not conn:
-        raise ReferenceError('weakly-referenced object no longer exists')
-    oid = object.__getattribute__(proxy, "____oid__")
-    return conn.sync_request(handler, oid, *args)
+    conn = object.__getattribute__(proxy, "____conn__")
+    return conn.sync_request(handler, proxy, *args)
+
 
 def asyncreq(proxy, handler, *args):
     """Performs an asynchronous request on the given proxy object.
     Not intended to be invoked directly.
 
     :param proxy: the proxy on which to issue the request
-    :param handler: the request handler (one of the ``HANDLE_XXX`` members of 
+    :param handler: the request handler (one of the ``HANDLE_XXX`` members of
                     ``rpyc.protocol.consts``)
     :param args: arguments to the handler
-    
-    :returns: an :class:`AsyncResult <rpyc.core.async.AsyncResult>` representing
+
+    :returns: an :class:`~rpyc.core.async_.AsyncResult` representing
               the operation
     """
-    conn = object.__getattribute__(proxy, "____conn__")()
-    if not conn:
-        raise ReferenceError('weakly-referenced object no longer exists')
-    oid = object.__getattribute__(proxy, "____oid__")
-    return conn.async_request(handler, oid, *args)
+    conn = object.__getattribute__(proxy, "____conn__")
+    return conn.async_request(handler, proxy, *args)
+
 
 class NetrefMetaclass(type):
     """A *metaclass* used to customize the ``__repr__`` of ``netref`` classes.
-    It is quite useless, but it makes debugging and interactive programming 
+    It is quite useless, but it makes debugging and interactive programming
     easier"""
-    
+
     __slots__ = ()
+
     def __repr__(self):
         if self.__module__:
             return "<netref class '%s.%s'>" % (self.__module__, self.__name__)
         else:
             return "<netref class '%s'>" % (self.__name__,)
 
-class BaseNetref(object):
+
+class BaseNetref(with_metaclass(NetrefMetaclass, object)):
     """The base netref class, from which all netref classes derive. Some netref
-    classes are "pre-generated" and cached upon importing this module (those 
-    defined in the :data:`_builtin_types`), and they are shared between all 
-    connections. 
-    
+    classes are "pre-generated" and cached upon importing this module (those
+    defined in the :data:`_builtin_types`), and they are shared between all
+    connections.
+
     The rest of the netref classes are created by :meth:`rpyc.core.protocl.Connection._unbox`,
     and are private to the connection.
-    
+
     Do not use this class directly; use :func:`class_factory` instead.
-    
+
     :param conn: the :class:`rpyc.core.protocol.Connection` instance
-    :param oid: the unique object ID of the remote object
+    :param id_pack: id tuple for an object ~ (name_pack, remote-class-id, remote-instance-id)
+        (cont.) name_pack := __module__.__name__ (hits or misses on builtin cache and sys.module)
+                remote-class-id := id of object class (hits or misses on netref classes cache and instance checks)
+                remote-instance-id := id object instance (hits or misses on proxy cache)
+        id_pack is usually created by rpyc.lib.get_id_pack
     """
-    # this is okay with py3k -- see below
-    __metaclass__ = NetrefMetaclass
-    __slots__ = ["____conn__", "____oid__", "__weakref__"]
-    def __init__(self, conn, oid):
+    __slots__ = ["____conn__", "____id_pack__", "__weakref__", "____refcount__"]
+
+    def __init__(self, conn, id_pack):
         self.____conn__ = conn
-        self.____oid__ = oid
+        self.____id_pack__ = id_pack
+        self.____refcount__ = 1
+
     def __del__(self):
         try:
-            asyncreq(self, consts.HANDLE_DEL)
+            asyncreq(self, consts.HANDLE_DEL, self.____refcount__)
         except Exception:
             # raised in a destructor, most likely on program termination,
             # when the connection might have already been closed.
@@ -130,7 +141,7 @@ class BaseNetref(object):
             pass
 
     def __getattribute__(self, name):
-        if name in _local_netref_attrs:
+        if name in LOCAL_ATTRS:
             if name == "__class__":
                 cls = object.__getattribute__(self, "__class__")
                 if cls is None:
@@ -138,58 +149,98 @@ class BaseNetref(object):
                 return cls
             elif name == "__doc__":
                 return self.__getattr__("__doc__")
-            elif name == "__members__":                       # for Python < 2.6
-                return self.__dir__()
+            elif name in DELETED_ATTRS:
+                raise AttributeError()
             else:
                 return object.__getattribute__(self, name)
         elif name == "__call__":                          # IronPython issue #10
             return object.__getattribute__(self, "__call__")
+        elif name == "__array__":
+            return object.__getattribute__(self, "__array__")
         else:
             return syncreq(self, consts.HANDLE_GETATTR, name)
+
     def __getattr__(self, name):
+        if name in DELETED_ATTRS:
+            raise AttributeError()
         return syncreq(self, consts.HANDLE_GETATTR, name)
+
     def __delattr__(self, name):
-        if name in _local_netref_attrs:
+        if name in LOCAL_ATTRS:
             object.__delattr__(self, name)
         else:
             syncreq(self, consts.HANDLE_DELATTR, name)
+
     def __setattr__(self, name, value):
-        if name in _local_netref_attrs:
+        if name in LOCAL_ATTRS:
             object.__setattr__(self, name, value)
         else:
             syncreq(self, consts.HANDLE_SETATTR, name, value)
+
     def __dir__(self):
         return list(syncreq(self, consts.HANDLE_DIR))
 
     # support for metaclasses
     def __hash__(self):
         return syncreq(self, consts.HANDLE_HASH)
+
     def __cmp__(self, other):
-        return syncreq(self, consts.HANDLE_CMP, other)
+        return syncreq(self, consts.HANDLE_CMP, other, '__cmp__')
+
+    def __eq__(self, other):
+        return syncreq(self, consts.HANDLE_CMP, other, '__eq__')
+
+    def __ne__(self, other):
+        return syncreq(self, consts.HANDLE_CMP, other, '__ne__')
+
+    def __lt__(self, other):
+        return syncreq(self, consts.HANDLE_CMP, other, '__lt__')
+
+    def __gt__(self, other):
+        return syncreq(self, consts.HANDLE_CMP, other, '__gt__')
+
+    def __le__(self, other):
+        return syncreq(self, consts.HANDLE_CMP, other, '__le__')
+
+    def __ge__(self, other):
+        return syncreq(self, consts.HANDLE_CMP, other, '__ge__')
+
     def __repr__(self):
         return syncreq(self, consts.HANDLE_REPR)
+
     def __str__(self):
         return syncreq(self, consts.HANDLE_STR)
+
     def __exit__(self, exc, typ, tb):
         return syncreq(self, consts.HANDLE_CTXEXIT, exc)  # can't pass type nor traceback
+
     # support for pickling netrefs
     def __reduce_ex__(self, proto):
+        # support for pickling netrefs
         return pickle.loads, (syncreq(self, consts.HANDLE_PICKLE, proto),)
 
-if not isinstance(BaseNetref, NetrefMetaclass):
-    # python 2 and 3 compatible metaclass...
-    ns = dict(BaseNetref.__dict__)
-    for slot in BaseNetref.__slots__:
-        ns.pop(slot)
-    BaseNetref = NetrefMetaclass(BaseNetref.__name__, BaseNetref.__bases__, ns) 
+    def __instancecheck__(self, other):
+        # support for checking cached instances across connections
+        if isinstance(other, BaseNetref):
+            if self.____id_pack__[2] != 0:
+                raise TypeError("isinstance() arg 2 must be a class, type, or tuple of classes and types")
+            elif self.____id_pack__[1] == other.____id_pack__[1]:
+                if other.____id_pack__[2] == 0:
+                    return False
+                elif other.____id_pack__[2] != 0:
+                    return True
+            else:
+                return syncreq(self, consts.HANDLE_INSTANCECHECK, other.____id_pack__)
+        else:
+            return isinstance(other, self)
 
 
 def _make_method(name, doc):
     """creates a method with the given name and docstring that invokes
     :func:`syncreq` on its `self` argument"""
-    
-    slicers = {"__getslice__" : "__getitem__", "__delslice__" : "__delitem__", "__setslice__" : "__setitem__"}
-    
+
+    slicers = {"__getslice__": "__getitem__", "__delslice__": "__delitem__", "__setslice__": "__setitem__"}
+
     name = str(name)                                      # IronPython issue #10
     if name == "__call__":
         def __call__(_self, *args, **kwargs):
@@ -205,6 +256,13 @@ def _make_method(name, doc):
         method.__name__ = name
         method.__doc__ = doc
         return method
+    elif name == "__array__":
+        def __array__(self):
+            # Note that protocol=-1 will only work between python
+            # interpreters of the same version.
+            return pickle.loads(syncreq(self, consts.HANDLE_PICKLE, -1))
+        __array__.__doc__ = doc
+        return __array__
     else:
         def method(_self, *args, **kwargs):
             kwargs = tuple(kwargs.items())
@@ -213,62 +271,47 @@ def _make_method(name, doc):
         method.__doc__ = doc
         return method
 
-def inspect_methods(obj):
-    """introspects the given (local) object, returning a list of all of its
-    methods (going up the MRO).
-    
-    :param obj: any local (not proxy) python object
-    
-    :returns: a list of ``(method name, docstring)`` tuples of all the methods
-              of the given object
-    """
-    methods = {}
-    attrs = {}
-    if isinstance(obj, type):
-        # don't forget the darn metaclass
-        mros = list(reversed(type(obj).__mro__)) + list(reversed(obj.__mro__))
-    else:
-        mros = reversed(type(obj).__mro__)
-    for basecls in mros:
-        attrs.update(basecls.__dict__)
-    for name, attr in attrs.items():
-        if name not in _local_netref_attrs and hasattr(attr, "__call__"):
-            methods[name] = inspect.getdoc(attr)
-    return methods.items()
 
-def class_factory(clsname, modname, methods):
+def class_factory(id_pack, methods):
     """Creates a netref class proxying the given class
-    
-    :param clsname: the class's name
-    :param modname: the class's module name
-    :param methods: a list of ``(method name, docstring)`` tuples, of the methods
-                    that the class defines
-    
+
+    :param id_pack: the id pack used for proxy communication
+    :param methods: a list of ``(method name, docstring)`` tuples, of the methods that the class defines
+
     :returns: a netref class
     """
-    clsname = str(clsname)                                # IronPython issue #10
-    modname = str(modname)                                # IronPython issue #10
-    ns = {"__slots__" : ()}
+    ns = {"__slots__": (), "__class__": None}
+    name_pack = id_pack[0]
+    if name_pack is not None:  # attempt to resolve against builtins and sys.modules
+        ns["__class__"] = _normalized_builtin_types.get(name_pack)
+        if ns["__class__"] is None:
+            _module = None
+            didx = name_pack.rfind('.')
+            if didx != -1:
+                _module = sys.modules.get(name_pack[:didx])
+                if _module is not None:
+                    _module = getattr(_module, name_pack[didx + 1:], None)
+                else:
+                    _module = sys.modules.get(name_pack)
+            else:
+                _module = sys.modules.get(name_pack)
+            if _module:
+                if id_pack[0] != 0:
+                    ns["__class__"] = _module
+                else:
+                    ns["__class__"] = getattr(_module, "__class__", None)
+
     for name, doc in methods:
-        name = str(name)                                  # IronPython issue #10
-        if name not in _local_netref_attrs:
+        name = str(name)  # IronPython issue #10
+        if name not in LOCAL_ATTRS:  # i.e. `name != __class__`
             ns[name] = _make_method(name, doc)
-    ns["__module__"] = modname
-    if modname in sys.modules and hasattr(sys.modules[modname], clsname):
-        ns["__class__"] = getattr(sys.modules[modname], clsname)
-    elif (clsname, modname) in _normalized_builtin_types:
-        ns["__class__"] = _normalized_builtin_types[clsname, modname]
-    else:
-        # to be resolved by the instance
-        ns["__class__"] = None
-    return type(clsname, (BaseNetref,), ns)
+    return type(name_pack, (BaseNetref,), ns)
 
-builtin_classes_cache = {}
-"""The cache of built-in netref classes (each of the types listed in 
-:data:`_builtin_types`). These are shared between all RPyC connections"""
 
-# init the builtin_classes_cache
-for cls in _builtin_types:
-    builtin_classes_cache[cls.__name__, cls.__module__] = class_factory(
-        cls.__name__, cls.__module__, inspect_methods(cls))
-
+for _builtin in _builtin_types:
+    _id_pack = get_id_pack(_builtin)
+    _name_pack = _id_pack[0]
+    _normalized_builtin_types[_name_pack] = _builtin
+    _builtin_methods = get_methods(LOCAL_ATTRS, _builtin)
+    # assume all normalized builtins are classes
+    builtin_classes_cache[_name_pack] = class_factory(_id_pack, _builtin_methods)

@@ -47,11 +47,12 @@ def setup_logger(quiet=False, logfile=None):
     log_level = logging.ERROR if quiet else logging.DEBUG
     logging.basicConfig(format=log_format, level=log_level)
 
-    max_size = 50 * 1024 * 1024  # 50 MB
-    formatter = logging.Formatter(fmt=log_format)
-    rotating_file_handler = logging.handlers.RotatingFileHandler(logfile, maxBytes=max_size, backupCount=1)
-    rotating_file_handler.setFormatter(formatter)
-    logging.root.addHandler(rotating_file_handler)
+    if logfile:
+        max_size = 50 * 1024 * 1024  # 50 MB
+        formatter = logging.Formatter(fmt=log_format)
+        rotating_file_handler = logging.handlers.RotatingFileHandler(logfile, maxBytes=max_size, backupCount=1)
+        rotating_file_handler.setFormatter(formatter)
+        logging.root.addHandler(rotating_file_handler)
 
 
 class hybridmethod(object):

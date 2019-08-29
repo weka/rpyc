@@ -59,7 +59,7 @@ DEFAULT_CONFIG = dict(
     credentials=None,
     endpoints=None,
     logger=None,
-    sync_request_timeout=30,
+    sync_request_timeout=None,  # Unlimited
 )
 """
 The default configuration dictionary of the protocol. You can override these parameters

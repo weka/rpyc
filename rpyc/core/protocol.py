@@ -46,6 +46,7 @@ DEFAULT_CONFIG = dict(
     allow_delattr=False,
     # EXCEPTIONS
     include_local_traceback=True,
+    include_local_version=True,
     instantiate_custom_exceptions=False,
     import_custom_exceptions=False,
     instantiate_oldstyle_exceptions=False,  # which don't derive from Exception
@@ -292,7 +293,7 @@ class Connection(object):
         if label == consts.LABEL_LOCAL_REF:
             return self._local_objects[value]
         if label == consts.LABEL_REMOTE_REF:
-            id_pack = value  # so value is a id_pack
+            id_pack = (str(value[0]), value[1], value[2])  # so value is a id_pack
             if id_pack in self._proxy_cache:
                 proxy = self._proxy_cache[id_pack]
                 proxy.____refcount__ += 1  # if cached then remote incremented refcount, so sync refcount
@@ -336,7 +337,9 @@ class Connection(object):
             self._send(consts.MSG_REPLY, seq, self._box(res))
 
     def _box_exc(self, typ, val, tb):  # dispatch?
-        return vinegar.dump(typ, val, tb, include_local_traceback=self._config["include_local_traceback"])
+        return vinegar.dump(typ, val, tb,
+                            include_local_traceback=self._config["include_local_traceback"],
+                            include_local_version=self._config["include_local_version"])
 
     def _unbox_exc(self, raw):  # dispatch?
         return vinegar.load(raw,
@@ -407,8 +410,14 @@ class Connection(object):
             self.close()
 
     def serve_threaded(self, thread_count=10):  # serving
-        """Serves all requests and replies for as long as the connection is
-        alive."""
+        """Serves all requests and replies for as long as the connection is alive.
+
+        CAVEAT: using non-immutable types that require a netref to be constructed to serve a request,
+        or invoking anything else that performs a sync_request, may timeout due to the sync_request reply being
+        received by another thread serving the connection. A more conventional approach where each client thread
+        opens a new connection would allow `ThreadedServer` to naturally avoid such multiplexing issues and
+        is the preferred approach for threading procedures that invoke sync_request. See issue #345
+        """
         def _thread_target():
             try:
                 while True:
@@ -562,12 +571,11 @@ class Connection(object):
         return str(obj)
 
     def _handle_cmp(self, obj, other, op='__cmp__'):  # request handler
-        # cmp() might enter recursive resonance... yet another workaround
-        # return cmp(obj, other)
+        # cmp() might enter recursive resonance... so use the underlying type and return cmp(obj, other)
         try:
-            return getattr(type(obj), op)(obj, other)
-        except (AttributeError, TypeError):
-            return NotImplemented
+            return self._access_attr(type(obj), op, (), "_rpyc_getattr", "allow_getattr", getattr)(obj, other)
+        except Exception:
+            raise
 
     def _handle_hash(self, obj):  # request handler
         return hash(obj)
@@ -579,7 +587,14 @@ class Connection(object):
         return tuple(dir(obj))
 
     def _handle_inspect(self, id_pack):  # request handler
-        return tuple(get_methods(netref.LOCAL_ATTRS, self._local_objects[id_pack]))
+        if hasattr(self._local_objects[id_pack], '____conn__'):
+            # When RPyC is chained (RPyC over RPyC), id_pack is cached in local objects as a netref
+            # since __mro__ is not a safe attribute the request is forwarded using the proxy connection
+            # see issue #346 or tests.test_rpyc_over_rpyc.Test_rpyc_over_rpyc
+            conn = self._local_objects[id_pack].____conn__
+            return conn.sync_request(consts.HANDLE_INSPECT, id_pack)
+        else:
+            return tuple(get_methods(netref.LOCAL_ATTRS, self._local_objects[id_pack]))
 
     def _handle_getattr(self, obj, name):  # request handler
         return self._access_attr(obj, name, (), "_rpyc_getattr", "allow_getattr", getattr)

@@ -1,3 +1,26 @@
+4.1.2
+-----
+Date: 10.03.2019
+
+- Fixed `CVE-2019-16328`_ which was caused by a missing protocol security check
+- Fixed RPyC over RPyC for mutable parameters and extended unit testing for `#346`_
+
+.. _CVE-2019-16328: https://rpyc.readthedocs.io/en/latest/docs/security.html
+.. _#346: https://github.com/tomerfiliba/rpyc/issues/346
+
+
+4.1.1
+-----
+Date: 07.27.2019
+
+- Fixed netref.class_factory id_pack usage per #339 and added test cases
+- Name pack casted in _unbox to fix IronPython bug. Fixed #337
+- Increased chunk size to improve multi-client response time and throughput of large data #329
+- Added warning to _remote_tb when the major version of local and remote mismatch (#332)
+- OneShotServer termination was fixed by WilliamBruneau (#343)
+- Known issue with 3.8 for CodeType parameters (may drop Python2 support first)
+
+
 4.1.0
 -----
 Date: 05.25.2019

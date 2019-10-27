@@ -21,7 +21,7 @@ LOCAL_ATTRS = frozenset([
     '__dir__', '__doc__', '__getattr__', '__getattribute__', '__hash__', '__instancecheck__',
     '__init__', '__metaclass__', '__module__', '__new__', '__reduce__',
     '__reduce_ex__', '__repr__', '__setattr__', '__slots__', '__str__',
-    '__weakref__', '__dict__', '__methods__', '__exit__',
+    '__weakref__', '__dict__', '__members__', '__methods__', '__exit__',
     '__eq__', '__ne__', '__lt__', '__gt__', '__le__', '__ge__',
 ]) | DELETED_ATTRS
 """the set of attributes that are local to the netref object"""
@@ -232,7 +232,7 @@ class BaseNetref(with_metaclass(NetrefMetaclass, object)):
             else:
                 return syncreq(self, consts.HANDLE_INSTANCECHECK, other.____id_pack__)
         else:
-            return isinstance(other, self)
+            return isinstance(other, self.__class__)
 
 
 def _make_method(name, doc):
@@ -296,7 +296,7 @@ def class_factory(id_pack, methods):
             else:
                 _module = sys.modules.get(name_pack)
             if _module:
-                if id_pack[0] != 0:
+                if id_pack[2] == 0:
                     ns["__class__"] = _module
                 else:
                     ns["__class__"] = getattr(_module, "__class__", None)

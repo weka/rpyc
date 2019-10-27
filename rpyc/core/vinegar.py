@@ -21,7 +21,13 @@ except ImportError:
 
 from rpyc.core import brine
 from rpyc.core import consts
+from rpyc import version
 from rpyc.lib.compat import is_py3k
+
+
+REMOTE_LINE_START = "\n\n========= Remote Traceback "
+REMOTE_LINE_END = " =========\n"
+REMOTE_LINE = "{0}({{}}){1}".format(REMOTE_LINE_START, REMOTE_LINE_END)
 
 
 try:
@@ -31,7 +37,7 @@ except NameError:
     BaseException = Exception
 
 
-def dump(typ, val, tb, include_local_traceback):
+def dump(typ, val, tb, include_local_traceback, include_local_version):
     """Dumps the given exceptions info, as returned by ``sys.exc_info()``
 
     :param typ: the exception's type (class)
@@ -77,6 +83,10 @@ def dump(typ, val, tb, include_local_traceback):
             if not brine.dumpable(attrval):
                 attrval = repr(attrval)
             attrs.append((name, attrval))
+    if include_local_version:
+        attrs.append(("_remote_version", version.version_string))
+    else:
+        attrs.append(("_remote_version", "<version denied>"))
     return (typ.__module__, typ.__name__), tuple(args), tuple(attrs), tbtext
 
 
@@ -108,6 +118,7 @@ def load(val, import_custom_exceptions, instantiate_custom_exceptions, instantia
         return val  # deprecated string exceptions
 
     (modname, clsname), args, attrs, tbtext = val
+
     if import_custom_exceptions and modname not in sys.modules:
         try:
             __import__(modname, None, None, "*")
@@ -161,6 +172,13 @@ def load(val, import_custom_exceptions, instantiate_custom_exceptions, instantia
             setattr(exc, name, attrval)
         except AttributeError:      # handle immutable attrs (@property)
             pass
+
+    # When possible and relevant, warn the user about mismatch in major versions between remote and local
+    remote_ver = getattr(exc, "_remote_version", "<version denied>")
+    if remote_ver != "<version denied>" and remote_ver.split('.')[0] != str(version.version[0]):
+        _warn = '\nWARNING: Remote is on RPyC {} and local is on RPyC {}.\n\n'
+        tbtext += _warn.format(remote_ver, version.version_string)
+
     exc._remote_tb = tbtext
     return exc
 
@@ -187,8 +205,8 @@ def _get_exception_class(cls):
             except Exception:
                 text = "<Unprintable exception>"
             if hasattr(self, "_remote_tb"):
-                text += "\n\n========= Remote Traceback (%d) =========\n%s" % (
-                    self._remote_tb.count("\n\n========= Remote Traceback") + 1, self._remote_tb)
+                text += REMOTE_LINE.format(self._remote_tb.count(REMOTE_LINE_START) + 1)
+                text += self._remote_tb
             return text
 
         def __repr__(self):

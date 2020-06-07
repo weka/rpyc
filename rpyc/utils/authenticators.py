@@ -27,6 +27,12 @@ import sys
 from rpyc.lib import safe_import
 ssl = safe_import("ssl")
 
+def get_available_protocols():
+    return [attr.partition('PROTOCOL_')[2] for attr in dir(ssl) if attr.startswith('PROTOCOL')]
+
+
+def get_protocol_by_name(protocol_name):
+    return getattr(ssl, 'PROTOCOL_%s' % protocol_name)
 
 class AuthenticationError(Exception):
     """raised to signal a failed authentication attempt"""

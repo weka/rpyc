@@ -16,10 +16,9 @@ from rpyc.utils.server import ThreadedServer, ForkingServer, OneShotServer
 from rpyc.utils.classic import DEFAULT_SERVER_PORT, DEFAULT_SERVER_SSL_PORT
 from rpyc.utils.registry import REGISTRY_PORT
 from rpyc.utils.registry import UDPRegistryClient, TCPRegistryClient
-from rpyc.utils.authenticators import SSLAuthenticator
+from rpyc.utils.authenticators import SSLAuthenticator, get_available_protocols, get_protocol_by_name
 from rpyc.lib import setup_logger
 from rpyc.core import SlaveService
-
 
 class ClassicServer(cli.Application):
     mode = cli.SwitchAttr(["-m", "--mode"], cli.Set("threaded", "forking", "stdio", "oneshot"),
@@ -43,6 +42,10 @@ class ClassicServer(cli.Application):
                                  requires=["--ssl-certfile"])
     ssl_certfile = cli.SwitchAttr("--ssl-certfile", cli.ExistingFile,
                                   help="The certificate file to use for SSL. Required for SSL", group="SSL",
+                                  requires=["--ssl-keyfile"])
+    ssl_version = cli.SwitchAttr("--ssl-version", cli.Set(*get_available_protocols(), case_sensitive=True),
+                                  default="TLSv1",
+                                  help="SSL Version", group="SSL",
                                   requires=["--ssl-keyfile"])
     ssl_cafile = cli.SwitchAttr("--ssl-cafile", cli.ExistingFile,
                                 help="The certificate authority chain file to use for SSL. "
@@ -75,7 +78,9 @@ class ClassicServer(cli.Application):
 
         if self.ssl_keyfile:
             self.authenticator = SSLAuthenticator(self.ssl_keyfile, self.ssl_certfile,
-                                                  self.ssl_cafile)
+                                                  self.ssl_cafile,
+                                                  ssl_version=get_protocol_by_name(self.ssl_version),
+                                                  )
             default_port = DEFAULT_SERVER_SSL_PORT
         else:
             self.authenticator = None

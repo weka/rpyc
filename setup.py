@@ -35,7 +35,7 @@ setup(name="rpyc",
       ],
       tests_require=['nose'],
       test_suite='nose.collector',
-      install_requires=["plumbum==1.6.9"],
+      install_requires=["plumbum==1.6.8"],
       #    entry_points = dict(
       #        console_scripts = [
       #            "rpyc_classic = rpyc.scripts.rpyc_classic:main",

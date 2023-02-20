@@ -19,15 +19,20 @@ if not isinstance(MyMeta, MyMeta):
     MyClass = MyMeta(MyClass.__name__, MyClass.__bases__, dict(MyClass.__dict__))
 
 
+@rpyc.service
 class MyService(rpyc.Service):
     on_connect_called = False
     on_disconnect_called = False
+    on_about_to_close_called = False
 
     def on_connect(self, conn):
         self.on_connect_called = True
 
     def on_disconnect(self, conn):
         self.on_disconnect_called = True
+
+    def exposed_on_about_to_close(self):
+        self.on_about_to_close_called = True
 
     def exposed_distance(self, p1, p2):
         x1, y1 = p1
@@ -46,25 +51,61 @@ class MyService(rpyc.Service):
     def exposed_instance(self, inst, cls):
         return isinstance(inst, cls)
 
+    @rpyc.exposed
+    class MyClass(object):
+        def __init__(self, a, b):
+            self.a = a
+            self.b = b
+
+        @rpyc.exposed
+        def foo(self):
+            return self.a + self.b
+
+    @rpyc.exposed
+    def get_decorated(self):
+        return "decorated"
+
+    @rpyc.exposed('prefix_')
+    def get_decorated_prefix(self):
+        return "decorated_prefix"
+
+
+def before_closed(root):
+    root.on_about_to_close()
+
 
 class TestCustomService(unittest.TestCase):
     config = {}
 
     def setUp(self):
         self.service = MyService()
-        self.conn = rpyc.connect_thread(remote_service=self.service)
+        client_config = {"before_closed": before_closed, "close_catchall": False}
+        prefixed_client_config = {'exposed_prefix': 'prefix_'}
+        self.conn = rpyc.connect_thread(remote_service=self.service, config=client_config)
+        self.prefixed_conn = rpyc.connect_thread(remote_service=self.service,
+                                                 config=prefixed_client_config,
+                                                 remote_config=prefixed_client_config)
         self.conn.root  # this will block until the service is initialized,
+        self.prefixed_conn.root  # this will block until the service is initialized,
         # so we can be sure on_connect_called is True by that time
         self.assertTrue(self.service.on_connect_called)
 
     def tearDown(self):
-        self.conn.close()
+        if not self.conn.closed:
+            self.conn.close()
+        if not self.prefixed_conn.closed:
+            self.prefixed_conn.close()
         time.sleep(0.5)  # this will wait a little, making sure
         # on_disconnect_called is already True
         self.assertTrue(self.service.on_disconnect_called)
 
+    def test_before_closed(self):
+        self.assertFalse(self.service.on_about_to_close_called)
+        self.conn.close()
+        self.assertTrue(self.service.on_about_to_close_called)
+
     def test_aliases(self):
-        print("service name: %s" % (self.conn.root.get_service_name(),))
+        print(f"service name: {self.conn.root.get_service_name()}")
 
     def test_distance(self):
         assert self.conn.root.distance((2, 7), (5, 11)) == 5
@@ -76,6 +117,14 @@ class TestCustomService(unittest.TestCase):
         self.conn.root.exposed_getlist
         # this is not an exposed attribute:
         self.assertRaises(AttributeError, lambda: self.conn.root.foobar())
+        # methods exposed using decorator
+        self.conn.root.get_decorated
+        self.conn.root.exposed_get_decorated
+        self.prefixed_conn.root.get_decorated_prefix
+        self.prefixed_conn.root.prefix_get_decorated_prefix
+        self.assertFalse(hasattr(self.conn.root, 'get_decorated_prefix'))
+        smc = self.conn.root.MyClass('a', 'b')
+        self.assertEqual(smc.foo(), 'ab')
 
     def test_safeattrs(self):
         x = self.conn.root.getlist()

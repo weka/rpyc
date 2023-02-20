@@ -4,6 +4,7 @@
 Requires [plumbum](http://plumbum.readthedocs.org/)
 """
 from __future__ import with_statement
+from subprocess import TimeoutExpired
 import sys
 import socket  # noqa: F401
 from rpyc.lib.compat import BYTES_LITERAL
@@ -13,6 +14,7 @@ import rpyc.utils.factory
 import rpyc.utils.classic
 try:
     from plumbum import local, ProcessExecutionError, CommandNotFound
+    from plumbum.commands.base import BoundCommand
     from plumbum.path import copy
 except ImportError:
     import inspect
@@ -54,7 +56,7 @@ $EXTRA_SETUP$
 t = ServerCls(SlaveService, hostname = "localhost", port = 0, reuse_addr = True, logger = logger)
 thd = t._start_in_thread()
 
-sys.stdout.write("%s\n" % (t.port,))
+sys.stdout.write(f"{t.port}\n")
 sys.stdout.flush()
 
 try:
@@ -102,13 +104,15 @@ class DeployedServer(object):
         modname, clsname = server_class.rsplit(".", 1)
         script.write(SERVER_SCRIPT.replace("$MODULE$", modname).replace(
             "$SERVER$", clsname).replace("$EXTRA_SETUP$", extra_setup))
-        if python_executable:
+        if isinstance(python_executable, BoundCommand):
+            cmd = python_executable
+        elif python_executable:
             cmd = remote_machine[python_executable]
         else:
             major = sys.version_info[0]
             minor = sys.version_info[1]
             cmd = None
-            for opt in ["python%s.%s" % (major, minor), "python%s" % (major,)]:
+            for opt in [f"python{major}.{minor}", f"python{major}"]:
                 try:
                     cmd = remote_machine[opt]
                 except CommandNotFound:
@@ -148,19 +152,39 @@ class DeployedServer(object):
     def __exit__(self, t, v, tb):
         self.close()
 
-    def close(self):
+    def close(self, timeout=None):
         if self.proc is not None:
             try:
                 self.proc.terminate()
+                self.proc.communicate(timeout=timeout)
+            except TimeoutExpired:
+                self.proc.kill()
+                raise
             except Exception:
                 pass
             self.proc = None
         if self.tun is not None:
             try:
+                self.tun._session.proc.terminate()
+                self.tun._session.proc.communicate(timeout=timeout)
                 self.tun.close()
+            except TimeoutExpired:
+                self.tun._session.proc.kill()
+                raise
             except Exception:
                 pass
             self.tun = None
+        if self.remote_machine is not None:
+            try:
+                self.remote_machine._session.proc.terminate()
+                self.remote_machine._session.proc.communicate(timeout=timeout)
+                self.remote_machine.close()
+            except TimeoutExpired:
+                self.remote_machine._session.proc.kill()
+                raise
+            except Exception:
+                pass
+            self.remote_machine = None
         if self._tmpdir_ctx is not None:
             try:
                 self._tmpdir_ctx.__exit__(None, None, None)

@@ -95,6 +95,8 @@ class TestRestricted(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+        while self.server.clients:
+            pass
         self.server.close()
         self.thd.join()
 
@@ -126,6 +128,8 @@ class TestConfigAllows(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+        while self.server.clients:
+            pass
         self.server.close()
         self.thd.join()
 
@@ -192,25 +196,59 @@ class TestConfigAllows(unittest.TestCase):
         self.assertEqual(obj.exposed_foobar(), "Fee Fie Foe Foo")
         self.assertRaises(AttributeError, lambda: obj._privy)
 
-#    def test_type_protector(self):
-#        obj = self.conn.root.get_two()
-#        assert obj.baba() == "baba"
-#        try:
-#            obj.gaga()
-#        except AttributeError:
-#            pass
-#        else:
-#            assert False, "expected an attribute error!"
-#        obj2 = obj.lala()
-#        assert obj2.foo() == "foo"
-#        assert obj2.spam() == "spam"
-#        try:
-#            obj.bar()
-#        except AttributeError:
-#            pass
-#        else:
-#            assert False, "expected an attribute error!"
-#
+
+class MyDescriptor1(object):
+    def __get__(self, instance, owner=None):
+        raise AttributeError("abcd")
+
+
+class MyDescriptor2(object):
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        else:
+            raise RuntimeError("efgh")
+
+
+@rpyc.service
+class MyDecoratedService(rpyc.Service):
+    desc_1 = rpyc.exposed(MyDescriptor1())
+    exposed_desc_2 = MyDescriptor2()
+
+
+class TestDescriptorErrors(unittest.TestCase):
+    """Validate stack traces are consistent independent of how exposed attribute is accessed #478 #479"""
+
+    def setUp(self):
+        self.cfg = copy.copy(rpyc.core.protocol.DEFAULT_CONFIG)
+        self.server = ThreadedServer(MyDecoratedService(), port=0)
+        self.thd = self.server._start_in_thread()
+        self.conn = rpyc.connect("localhost", self.server.port)
+
+    def tearDown(self):
+        self.conn.close()
+        while self.server.clients:
+            pass
+        self.server.close()
+        self.thd.join()
+
+    def test_default_config(self):
+        root = self.conn.root
+        self.assertRaisesRegex(AttributeError, "abcd", lambda: root.exposed_desc_1)
+        self.assertRaisesRegex(AttributeError, "abcd", lambda: root.desc_1)
+        self.assertRaisesRegex(RuntimeError, "efgh", lambda: root.exposed_desc_2)
+        self.assertRaisesRegex(RuntimeError, "efgh", lambda: root.desc_2)
+
+    def test_allow_all(self):
+        self.cfg['allow_all_attrs'] = True
+        self.conn.close()
+        self.server.protocol_config.update(self.cfg)
+        self.conn = rpyc.connect("localhost", self.server.port)
+        root = self.conn.root
+        self.assertRaisesRegex(AttributeError, "abcd", lambda: root.exposed_desc_1)
+        self.assertRaisesRegex(AttributeError, "abcd", lambda: root.desc_1)
+        self.assertRaisesRegex(RuntimeError, "efgh", lambda: root.exposed_desc_2)
+        self.assertRaisesRegex(RuntimeError, "efgh", lambda: root.desc_2)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@ import os
 import tempfile
 import shutil
 import unittest
-from nose import SkipTest
 import rpyc
 
 
@@ -20,7 +19,7 @@ class Test_Remoting(unittest.TestCase):
         base3 = os.path.join(base, "3")
         os.mkdir(base1)
         for i in range(10):
-            f = open(os.path.join(base1, "foofoo%d" % (i,)), "w")
+            f = open(os.path.join(base1, f"foofoo{i}"), "w")
             f.close()
         os.mkdir(os.path.join(base1, "somedir1"))
 
@@ -32,16 +31,17 @@ class Test_Remoting(unittest.TestCase):
 
         shutil.rmtree(base)
 
+    @unittest.skip("TODO: upload a package and a module")
     def test_distribution(self):
-        raise SkipTest("TODO: upload a package and a module")
+        pass
 
+    @unittest.skip("Requires manual testing atm")
     def test_interactive(self):
-        raise SkipTest("Need to be manually")
         print("type Ctrl+D to exit (Ctrl+Z on Windows)")
         rpyc.classic.interact(self.conn)
 
+    @unittest.skip("Requires manual testing atm")
     def test_post_mortem(self):
-        raise SkipTest("Need to be manually")
         try:
             self.conn.modules.sys.path[100000]
         except IndexError:

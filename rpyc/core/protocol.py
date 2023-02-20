@@ -6,9 +6,14 @@ import socket
 import time  # noqa: F401
 import gc  # noqa: F401
 
-from threading import Lock, Condition
-from rpyc.lib import spawn, Timeout, get_methods, get_id_pack
-from rpyc.lib.compat import pickle, next, is_py3k, maxint, select_error, acquire_lock  # noqa: F401
+import collections
+import concurrent.futures as c_futures
+import os
+import threading
+
+from threading import Lock, Condition, RLock
+from rpyc.lib import spawn, Timeout, get_methods, get_id_pack, hasattr_static
+from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # noqa: F401
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
 from rpyc.core import consts, brine, vinegar, netref
 from rpyc.core.async_ import AsyncResult
@@ -39,7 +44,7 @@ DEFAULT_CONFIG = dict(
                     '__rpow__', '__rrshift__', '__rshift__', '__rsub__', '__rtruediv__',
                     '__rxor__', '__setitem__', '__setslice__', '__str__', '__sub__',
                     '__truediv__', '__xor__', 'next', '__length_hint__', '__enter__',
-                    '__exit__', '__next__', ]),
+                    '__exit__', '__next__', '__format__']),
     exposed_prefix="exposed_",
     allow_getattr=True,
     allow_setattr=False,
@@ -60,6 +65,9 @@ DEFAULT_CONFIG = dict(
     endpoints=None,
     logger=None,
     sync_request_timeout=30,
+    before_closed=None,
+    close_catchall=False,
+    bind_threads=os.environ.get('RPYC_BIND_THREADS') == 'true',
 )
 """
 The default configuration dictionary of the protocol. You can override these parameters
@@ -107,7 +115,7 @@ Parameter                                Default value     Description
 
 ``connid``                               ``None``          **Runtime**: the RPyC connection ID (used
                                                            mainly for debugging purposes)
-``credentials``                          ``None``          **Runtime**: the credentails object that was returned
+``credentials``                          ``None``          **Runtime**: the credentials object that was returned
                                                            by the server's :ref:`authenticator <api-authenticators>`
                                                            or ``None``
 ``endpoints``                            ``None``          **Runtime**: The connection's endpoints. This is a tuple
@@ -117,6 +125,9 @@ Parameter                                Default value     Description
                                                            do no have this configuration option set.
 
 ``sync_request_timeout``                 ``30``            Default timeout for waiting results
+``bind_threads``                         ``False``         Whether to restrict request/reply by thread (experimental).
+                                                           The default value is False. Setting the environment variable
+                                                           `RPYC_BIND_THREADS` to `"true"` will enable this feature.
 =======================================  ================  =====================================================
 """
 
@@ -126,6 +137,11 @@ _connection_id_generator = itertools.count(1)
 
 class Connection(object):
     """The RPyC *connection* (AKA *protocol*).
+
+    Objects referenced over the connection are either local or remote. This class retains a strong reference to
+    local objects that is deleted when the reference count is zero. Remote/proxied objects have a life-cycle
+    controlled by a different address space. Since garbage collection is handled on the remote end, a weak reference
+    is used for netrefs.
 
     :param root: the :class:`~rpyc.core.service.Service` object to expose
     :param channel: the :class:`~rpyc.core.channel.Channel` over which messages are passed
@@ -138,14 +154,14 @@ class Connection(object):
         self._config = DEFAULT_CONFIG.copy()
         self._config.update(config)
         if self._config["connid"] is None:
-            self._config["connid"] = "conn%d" % (next(_connection_id_generator),)
+            self._config["connid"] = f"conn{next(_connection_id_generator)}"
 
         self._HANDLERS = self._request_handlers()
         self._channel = channel
         self._seqcounter = itertools.count()
-        self._recvlock = Lock()
+        self._recvlock = RLock()  # AsyncResult implementation means that synchronous requests have multiple acquires
         self._sendlock = Lock()
-        self._recv_event = Condition()
+        self._recv_event = Condition()  # TODO: why not simply timeout? why not associate w/ recvlock? explain/redesign
         self._request_callbacks = {}
         self._local_objects = RefCountingColl()
         self._last_traceback = None
@@ -155,6 +171,13 @@ class Connection(object):
         self._send_queue = []
         self._local_root = root
         self._closed = False
+        self._bind_threads = self._config['bind_threads']
+        if self._bind_threads:
+            self._lock = threading.Lock()
+            self._threads = {}
+            self._receiving = False
+            self._thread_pool = []
+            self._thread_pool_executor = c_futures.ThreadPoolExecutor()
 
     def __del__(self):
         self.close()
@@ -167,7 +190,7 @@ class Connection(object):
 
     def __repr__(self):
         a, b = object.__repr__(self).split(" object ")
-        return "%s %r object %s" % (a, self._config["connid"], b)
+        return f"{a} {self._config['connid']!r} object {b}"
 
     def _cleanup(self, _anyway=True):  # IO
         if self._closed and not _anyway:
@@ -185,18 +208,22 @@ class Connection(object):
         # self._seqcounter = None
         # self._config.clear()
         del self._HANDLERS
+        if self._bind_threads:
+            self._thread_pool_executor.shutdown(wait=False)  # TODO where?
 
-    def close(self, _catchall=True):  # IO
+    def close(self):  # IO
         """closes the connection, releasing all held resources"""
         if self._closed:
             return
-        self._closed = True
         try:
+            self._closed = True
+            if self._config.get("before_closed"):
+                self._config["before_closed"](self.root)
             self._async_request(consts.HANDLE_CLOSE)
         except EOFError:
             pass
         except Exception:
-            if not _catchall:
+            if not self._config["close_catchall"]:
                 raise
         finally:
             self._cleanup(_anyway=True)
@@ -231,6 +258,15 @@ class Connection(object):
 
     def _send(self, msg, seq, args):  # IO
         data = brine.dump((msg, seq, args))
+        if self._bind_threads:
+            this_thread = self._get_thread()
+            data = brine.I4I4.pack(this_thread.id, this_thread._remote_thread_id) + data
+            if msg == consts.MSG_REQUEST:
+                this_thread._occupation_count += 1
+            else:
+                this_thread._occupation_count -= 1
+                if this_thread._occupation_count == 0:
+                    this_thread._remote_thread_id = 0
         # GC might run while sending data
         # if so, a BaseNetref.__del__ might be called
         # BaseNetref.__del__ must call asyncreq,
@@ -272,13 +308,6 @@ class Connection(object):
         else:
             id_pack = get_id_pack(obj)
             self._local_objects.add(id_pack, obj)
-            try:
-                cls = obj.__class__
-            except Exception:
-                # see issue #16
-                cls = type(obj)
-            if not isinstance(cls, type):
-                cls = type(obj)
             return consts.LABEL_REMOTE_REF, id_pack
 
     def _unbox(self, package):  # boxing
@@ -301,19 +330,23 @@ class Connection(object):
                 proxy = self._netref_factory(id_pack)
                 self._proxy_cache[id_pack] = proxy
             return proxy
-        raise ValueError("invalid label %r" % (label,))
+        raise ValueError(f"invalid label {label!r}")
 
     def _netref_factory(self, id_pack):  # boxing
         """id_pack is for remote, so when class id fails to directly match """
-        if id_pack[0] in netref.builtin_classes_cache:
+        cls = None
+        if id_pack[2] == 0 and id_pack in self._netref_classes_cache:
+            cls = self._netref_classes_cache[id_pack]
+        elif id_pack[0] in netref.builtin_classes_cache:
             cls = netref.builtin_classes_cache[id_pack[0]]
-        elif id_pack[1] in self._netref_classes_cache:
-            cls = self._netref_classes_cache[id_pack[1]]
-        else:
+        if cls is None:
             # in the future, it could see if a sys.module cache/lookup hits first
             cls_methods = self.sync_request(consts.HANDLE_INSPECT, id_pack)
             cls = netref.class_factory(id_pack, cls_methods)
-            self._netref_classes_cache[id_pack[1]] = cls
+            if id_pack[2] == 0:
+                # only use cached netrefs for classes
+                # ... instance caching after gc of a proxy will take some mental gymnastics
+                self._netref_classes_cache[id_pack] = cls
         return cls(self, id_pack)
 
     def _dispatch_request(self, seq, raw_args):  # dispatch
@@ -321,7 +354,7 @@ class Connection(object):
             handler, args = raw_args
             args = self._unbox(args)
             res = self._HANDLERS[handler](self, *args)
-        except Exception:
+        except:  # TODO: revist how to catch handle locally, this should simplify when py2 is dropped
             # need to catch old style exceptions too
             t, v, tb = sys.exc_info()
             self._last_traceback = tb
@@ -347,18 +380,34 @@ class Connection(object):
                             instantiate_custom_exceptions=self._config["instantiate_custom_exceptions"],
                             instantiate_oldstyle_exceptions=self._config["instantiate_oldstyle_exceptions"])
 
+    def _seq_request_callback(self, msg, seq, is_exc, obj):
+        _callback = self._request_callbacks.pop(seq, None)
+        if _callback is not None:
+            _callback(is_exc, obj)
+        elif self._config["logger"] is not None:
+            debug_msg = 'Recieved {} seq {} and a related request callback did not exist'
+            self._config["logger"].debug(debug_msg.format(msg, seq))
+
     def _dispatch(self, data):  # serving---dispatch?
         msg, seq, args = brine.load(data)
         if msg == consts.MSG_REQUEST:
+            if self._bind_threads:
+                self._get_thread()._occupation_count += 1
             self._dispatch_request(seq, args)
-        elif msg == consts.MSG_REPLY:
-            obj = self._unbox(args)
-            self._request_callbacks.pop(seq)(False, obj)
-        elif msg == consts.MSG_EXCEPTION:
-            obj = self._unbox_exc(args)
-            self._request_callbacks.pop(seq)(True, obj)
         else:
-            raise ValueError("invalid message type: %r" % (msg,))
+            if self._bind_threads:
+                this_thread = self._get_thread()
+                this_thread._occupation_count -= 1
+                if this_thread._occupation_count == 0:
+                    this_thread._remote_thread_id = 0
+            if msg == consts.MSG_REPLY:
+                obj = self._unbox(args)
+                self._seq_request_callback(msg, seq, False, obj)
+            elif msg == consts.MSG_EXCEPTION:
+                obj = self._unbox_exc(args)
+                self._seq_request_callback(msg, seq, True, obj)
+            else:
+                raise ValueError(f"invalid message type: {msg!r}")
 
     def serve(self, timeout=1, wait_for_lock=True):  # serving
         """Serves a single request or reply that arrives within the given
@@ -366,26 +415,228 @@ class Connection(object):
         might trigger multiple (nested) requests, thus this function may be
         reentrant.
 
-        :returns: ``True`` if a request or reply were received, ``False``
-                  otherwise.
+        :returns: ``True`` if a request or reply were received, ``False`` otherwise.
         """
         timeout = Timeout(timeout)
+        if self._bind_threads:
+            return self._serve_bound(timeout, wait_for_lock)
         with self._recv_event:
+            # Exit early if we cannot acquire the recvlock
             if not self._recvlock.acquire(False):
-                return wait_for_lock and self._recv_event.wait(timeout.timeleft())
+                if wait_for_lock:
+                    # Wait condition for recvlock release; recvlock is not underlying lock for condition
+                    return self._recv_event.wait(timeout.timeleft())
+                else:
+                    return False
+        # Assume the receive rlock is acquired and incremented
         try:
+            data = None  # Ensure data is initialized
             data = self._channel.poll(timeout) and self._channel.recv()
-            if not data:
-                return False
-        except EOFError:
-            self.close()
-            raise
-        finally:
+        except Exception as exc:
+            if isinstance(exc, EOFError):
+                self.close()  # sends close async request
             self._recvlock.release()
             with self._recv_event:
                 self._recv_event.notify_all()
-        self._dispatch(data)
-        return True
+            raise
+        # At this point, the recvlock was acquired once, we must release once before exiting the function
+        if data:
+            # Dispatch will unbox, invoke callbacks, etc.
+            self._dispatch(data)
+            self._recvlock.release()
+            with self._recv_event:
+                self._recv_event.notify_all()
+            return True
+        else:
+            self._recvlock.release()
+            return False
+
+    def _serve_bound(self, timeout, wait_for_lock):
+        """Serves messages like `serve` with the added benefit of making request/reply thread bound.
+        - Experimental functionality `RPYC_BIND_THREADS`
+
+        The first 8 bytes indicate the sending thread ID and intended recipient ID. When the recipient
+        thread ID is not the thread that received the data, the remote thread ID and message are appended
+        to the intended threads `_deque` and `_event` is set.
+
+        :returns: ``True`` if a request or reply were received, ``False`` otherwise.
+        """
+        this_thread = self._get_thread()
+        wait = False
+
+        with self._lock:
+            message_available = this_thread._event.is_set() and len(this_thread._deque) != 0
+
+            if message_available:
+                remote_thread_id, message = this_thread._deque.popleft()
+                if len(this_thread._deque) == 0:
+                    this_thread._event.clear()
+
+            else:
+                if self._receiving:  # enter pool
+                    self._thread_pool.append(this_thread)
+                    wait = True
+
+                else:
+                    self._receiving = True
+
+        if message_available:  # just process
+            this_thread._remote_thread_id = remote_thread_id
+            self._dispatch(message)
+            return True
+
+        if wait:
+            while True:
+                if wait_for_lock:
+                    this_thread._event.wait(timeout.timeleft())
+
+                with self._lock:
+                    if this_thread._event.is_set():
+                        message_available = len(this_thread._deque) != 0
+
+                        if message_available:
+                            remote_thread_id, message = this_thread._deque.popleft()
+                            if len(this_thread._deque) == 0:
+                                this_thread._event.clear()
+
+                        else:
+                            this_thread._event.clear()
+
+                            if self._receiving:  # another thread was faster
+                                continue
+
+                            self._receiving = True
+
+                        self._thread_pool.remove(this_thread)  # leave pool
+                        break
+
+                    else:  # timeout
+                        return False
+
+            if message_available:
+                this_thread._remote_thread_id = remote_thread_id
+                self._dispatch(message)
+                return True
+
+        while True:
+            # from upstream
+            try:
+                message = self._channel.poll(timeout) and self._channel.recv()
+
+            except Exception as exception:
+                if isinstance(exception, EOFError):
+                    self.close()  # sends close async request
+
+                with self._lock:
+                    self._receiving = False
+
+                    for thread in self._thread_pool:
+                        thread._event.set()
+                        break
+
+                raise
+
+            if not message:  # timeout; from upstream
+                with self._lock:
+                    for thread in self._thread_pool:
+                        if not thread._event.is_set():
+                            self._receiving = False
+                            thread._event.set()
+                            break
+
+                    else:  # stop receiving
+                        self._receiving = False
+
+                return False
+
+            remote_thread_id, local_thread_id = brine.I4I4.unpack(message[:16])
+            message = message[16:]
+
+            this = False
+
+            if local_thread_id == 0:  # root request
+                if this_thread._occupation_count == 0:  # this
+                    this = True
+
+                else:  # other
+                    new = False
+
+                    with self._lock:
+                        for thread in self._thread_pool:
+                            if thread._occupation_count == 0 and not thread._event.is_set():
+                                thread._deque.append((remote_thread_id, message))
+                                thread._event.set()
+                                break
+
+                        else:
+                            new = True
+
+                    if new:
+                        self._thread_pool_executor.submit(self._serve_temporary, remote_thread_id, message)
+
+            elif local_thread_id == this_thread.id:
+                this = True
+
+            else:  # sub request
+                thread = self._get_thread(id=local_thread_id)
+                with self._lock:
+                    thread._deque.append((remote_thread_id, message))
+                    thread._event.set()
+
+            if this:
+                with self._lock:
+                    for thread in self._thread_pool:
+                        if not thread._event.is_set():
+                            self._receiving = False
+                            thread._event.set()
+                            break
+
+                    else:  # stop receiving
+                        self._receiving = False
+
+                this_thread._remote_thread_id = remote_thread_id
+                self._dispatch(message)
+                return True
+
+    def _serve_temporary(self, remote_thread_id, message):
+        """Callable that is used to schedule serve as a new thread
+        - Experimental functionality `RPYC_BIND_THREADS`
+
+        :returns: None
+        """
+        thread = self._get_thread()
+        thread._deque.append((remote_thread_id, message))
+        thread._event.set()
+
+        # from upstream
+        try:
+            while not self.closed:
+                self.serve(None)
+
+                if thread._occupation_count == 0:
+                    break
+
+        except (socket.error, select_error, IOError):
+            if not self.closed:
+                raise
+        except EOFError:
+            pass
+
+    def _get_thread(self, id=None):
+        """Get internal thread information for current thread for ID, when None use current thread.
+        - Experimental functionality `RPYC_BIND_THREADS`
+
+        :returns: _Thread
+        """
+        if id is None:
+            id = threading.get_ident()
+
+        thread = self._threads.get(id)
+        if thread is None:
+            thread = _Thread(id)
+            self._threads[id] = thread
+
+        return thread
 
     def poll(self, timeout=0):  # serving
         """Serves a single transaction, should one arrives in the given
@@ -454,13 +705,17 @@ class Connection(object):
             pass
         return at_least_once
 
-    def sync_request(self, handler, *args):  # serving
+    def sync_request(self, handler, *args):
         """requests, sends a synchronous request (waits for the reply to arrive)
 
         :raises: any exception that the requets may be generated
         :returns: the result of the request
         """
-        return self.async_request(handler, *args).value
+        timeout = self._config["sync_request_timeout"]
+        _async_res = self.async_request(handler, *args, timeout=timeout)
+        # _async_res is an instance of AsyncResult, the value property invokes Connection.serve via AsyncResult.wait
+        # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
+        return _async_res.value
 
     def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
         seq = self._get_seq_id()
@@ -468,6 +723,9 @@ class Connection(object):
         try:
             self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
         except Exception:
+            # TODO: review test_remote_exception, logging exceptions show attempt to write on closed stream
+            # depending on the case, the MSG_REQUEST may or may not have been sent completely
+            # so, pop the callback and raise to keep response integrity is consistent
             self._request_callbacks.pop(seq, None)
             raise
 
@@ -479,7 +737,7 @@ class Connection(object):
         """
         timeout = kwargs.pop("timeout", None)
         if kwargs:
-            raise TypeError("got unexpected keyword argument(s) %s" % (list(kwargs.keys()),))
+            raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
         res = AsyncResult(self)
         self._async_request(handler, args, res)
         if timeout is not None:
@@ -496,31 +754,26 @@ class Connection(object):
     def _check_attr(self, obj, name, perm):  # attribute access
         config = self._config
         if not config[perm]:
-            raise AttributeError("cannot access %r" % (name,))
+            raise AttributeError(f"cannot access {name!r}")
         prefix = config["allow_exposed_attrs"] and config["exposed_prefix"]
         plain = config["allow_all_attrs"]
         plain |= config["allow_exposed_attrs"] and name.startswith(prefix)
         plain |= config["allow_safe_attrs"] and name in config["safe_attrs"]
         plain |= config["allow_public_attrs"] and not name.startswith("_")
-        has_exposed = prefix and hasattr(obj, prefix + name)
+        has_exposed = prefix and (hasattr(obj, prefix + name) or hasattr_static(obj, prefix + name))
         if plain and (not has_exposed or hasattr(obj, name)):
             return name
         if has_exposed:
             return prefix + name
         if plain:
             return name  # chance for better traceback
-        raise AttributeError("cannot access %r" % (name,))
+        raise AttributeError(f"cannot access {name!r}")
 
     def _access_attr(self, obj, name, args, overrider, param, default):  # attribute access
-        if is_py3k:
-            if type(name) is bytes:
-                name = str(name, "utf8")
-            elif type(name) is not str:
-                raise TypeError("name must be a string")
-        else:
-            if type(name) not in (str, unicode):  # noqa
-                raise TypeError("name must be a string")
-            name = str(name)  # IronPython issue #10 + py3k issue
+        if type(name) is bytes:
+            name = str(name, "utf8")
+        elif type(name) is not str:
+            raise TypeError("name must be a string")
         accessor = getattr(type(obj), overrider, None)
         if accessor is None:
             accessor = default
@@ -620,14 +873,27 @@ class Connection(object):
         return self._handle_getattr(obj, "__exit__")(exc, typ, tb)
 
     def _handle_instancecheck(self, obj, other_id_pack):
+        # TODOs:
+        #  + refactor cache instancecheck/inspect/class_factory
+        #  + improve cache docs
+
+        if hasattr(obj, '____conn__'):  # keep unwrapping!
+            # When RPyC is chained (RPyC over RPyC), id_pack is cached in local objects as a netref
+            # since __mro__ is not a safe attribute the request is forwarded using the proxy connection
+            # relates to issue #346 or tests.test_netref_hierachy.Test_Netref_Hierarchy.test_StandardError
+            conn = obj.____conn__
+            return conn.sync_request(consts.HANDLE_INSPECT, other_id_pack)
         # Create a name pack which would be familiar here and see if there is a hit
         other_id_pack2 = (other_id_pack[0], other_id_pack[1], 0)
-        if other_id_pack2 in self._netref_classes_cache:
+        if other_id_pack[0] in netref.builtin_classes_cache:
+            cls = netref.builtin_classes_cache[other_id_pack[0]]
+            other = cls(self, other_id_pack)
+        elif other_id_pack2 in self._netref_classes_cache:
             cls = self._netref_classes_cache[other_id_pack2]
             other = cls(self, other_id_pack2)
-            return isinstance(other, obj)
         else:  # might just have missed cache, FIX ME
             return False
+        return isinstance(other, obj)
 
     def _handle_pickle(self, obj, proto):  # request handler
         if not self._config["allow_pickle"]:
@@ -648,3 +914,17 @@ class Connection(object):
                 stop = maxint
             getslice = self._handle_getattr(obj, fallback)
             return getslice(start, stop, *args)
+
+
+class _Thread:
+    """Internal thread information for the RPYC protocol used for thread binding."""
+
+    def __init__(self, id):
+        super().__init__()
+
+        self.id = id
+
+        self._remote_thread_id = 0
+        self._occupation_count = 0
+        self._event = threading.Event()
+        self._deque = collections.deque()

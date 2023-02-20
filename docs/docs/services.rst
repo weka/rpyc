@@ -24,7 +24,7 @@ Let's have a look at a rather basic service -- a calculator
         def exposed_div(self, a, b):
             return a / b
         def foo(self):
-            print "foo"
+            print("foo")
 
 When a client connects, it can access any of the exposed members of the service ::
 
@@ -43,6 +43,31 @@ As you can see, the ``root`` attribute of the connection gives you access to the
 that's exposed by the other party. For security concerns, access is only granted to
 ``exposed_`` members. For instance, the ``foo`` method above is inaccessible (attempting to
 call it will result in an ``AttributeError``).
+
+Rather than having each method name start with ``exposed_``, you may prefer to use a
+decorator. Let's revisit the calculator service, but this time we'll use decorators. ::
+
+    import rpyc
+
+    @rpyc.service
+    class CalculatorService(rpyc.Service):
+        @rpyc.exposed
+        def add(self, a, b):
+            return a + b
+        @rpyc.exposed
+        def sub(self, a, b):
+            return a - b
+        @rpyc.exposed
+        def mul(self, a, b):
+            return a * b
+        @rpyc.exposed
+        def div(self, a, b):
+            return a / b
+        def foo(self):
+            print "foo"
+
+When implementing services, ``@rpyc.service`` and ``@rpyc.exposed`` can replace the ``exposed_`` naming
+convention.
 
 Implementing Services
 ---------------------
@@ -67,14 +92,9 @@ If you wish to change the name of your service, or specify a list of aliases, se
 The first name in this list is considered the "proper name" of the service, while the rest
 are considered aliases. This distinction is meaningless to the protocol and the registry server.
 
-Your service class may also define two special methods: ``on_connect(self)`` and
-``on_disconnect(self)``. These methods are invoked, not surprisingly, when a connection
-has been established, and when it's been disconnected. Note that during ``on_disconnect``,
-the connection is already dead, so you can no longer access any remote objects.
-
-Other than that, your service instance has the ``_conn`` attribute, which represents the
-:class:`~rpyc.core.protocol.Connection` that it serves. This attribute already
-exists when ``on_connected`` is called.
+Your service class may also define two special methods: ``on_connect(self, conn)`` and
+``on_disconnect(self, conn)``. The ``on_connect`` method is invoked when a connection has been established.
+From the client-side perspective, ``on_connect`` is invoked each time a client successfully invokes ``rpyc.connect`` or any other function provided by the connection factory module: ``rpyc.utils.factory``. After the connection is dead, ``on_disconnect`` is invoked (you will not be able to access remote objects inside of ``on_disconnect``).
 
 .. note::
    Try to avoid overriding the ``__init__`` method of the service. Place all initialization-related
@@ -109,6 +129,9 @@ it's not the most common use case, two-sides services are quite useful. Consider
 And this server::
 
     class ServerService(rpyc.Service):
+        def on_connect(self, conn):
+            self._conn = conn
+
         def exposed_bar(self):
             return self._conn.root.foo() + "bar"
 

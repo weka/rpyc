@@ -4,7 +4,7 @@ of *magic*, so beware.
 import sys
 import types
 from rpyc.lib import get_methods, get_id_pack
-from rpyc.lib.compat import pickle, is_py3k, maxint, with_metaclass
+from rpyc.lib.compat import pickle, maxint, with_metaclass
 from rpyc.core import consts
 
 
@@ -16,6 +16,7 @@ DELETED_ATTRS = frozenset([
     '__array_struct__', '__array_interface__',
 ])
 
+"""the set of attributes that are local to the netref object"""
 LOCAL_ATTRS = frozenset([
     '____conn__', '____id_pack__', '____refcount__', '__class__', '__cmp__', '__del__', '__delattr__',
     '__dir__', '__doc__', '__getattr__', '__getattribute__', '__hash__', '__instancecheck__',
@@ -24,39 +25,25 @@ LOCAL_ATTRS = frozenset([
     '__weakref__', '__dict__', '__members__', '__methods__', '__exit__',
     '__eq__', '__ne__', '__lt__', '__gt__', '__le__', '__ge__',
 ]) | DELETED_ATTRS
-"""the set of attributes that are local to the netref object"""
 
+"""a list of types considered built-in (shared between connections)
+this is needed because iterating the members of the builtins module is not enough,
+some types (e.g NoneType) are not members of the builtins module.
+TODO: this list is not complete.
+"""
 _builtin_types = [
     type, object, bool, complex, dict, float, int, list, slice, str, tuple, set,
-    frozenset, Exception, type(None), types.BuiltinFunctionType, types.GeneratorType,
+    frozenset, BaseException, Exception, type(None), types.BuiltinFunctionType, types.GeneratorType,
     types.MethodType, types.CodeType, types.FrameType, types.TracebackType,
-    types.ModuleType, types.FunctionType,
+    types.ModuleType, types.FunctionType, types.MappingProxyType,
 
     type(int.__add__),      # wrapper_descriptor
     type((1).__add__),      # method-wrapper
     type(iter([])),         # listiterator
     type(iter(())),         # tupleiterator
     type(iter(set())),      # setiterator
+    bytes, bytearray, type(iter(range(10))), memoryview
 ]
-"""a list of types considered built-in (shared between connections)"""
-
-try:
-    BaseException
-except NameError:
-    pass
-else:
-    _builtin_types.append(BaseException)
-
-if is_py3k:
-    _builtin_types.extend([
-        bytes, bytearray, type(iter(range(10))), memoryview,
-    ])
-    xrange = range
-else:
-    _builtin_types.extend([
-        basestring, unicode, long, xrange, type(iter(xrange(10))), file,  # noqa
-        types.InstanceType, types.ClassType, types.DictProxyType,
-    ])
 _normalized_builtin_types = {}
 
 
@@ -101,9 +88,9 @@ class NetrefMetaclass(type):
 
     def __repr__(self):
         if self.__module__:
-            return "<netref class '%s.%s'>" % (self.__module__, self.__name__)
+            return f"<netref class '{self.__module__}.{self.__name__}'>"
         else:
-            return "<netref class '%s'>" % (self.__name__,)
+            return f"<netref class '{self.__name__}'>"
 
 
 class BaseNetref(with_metaclass(NetrefMetaclass, object)):
@@ -214,7 +201,6 @@ class BaseNetref(with_metaclass(NetrefMetaclass, object)):
     def __exit__(self, exc, typ, tb):
         return syncreq(self, consts.HANDLE_CTXEXIT, exc)  # can't pass type nor traceback
 
-    # support for pickling netrefs
     def __reduce_ex__(self, proto):
         # support for pickling netrefs
         return pickle.loads, (syncreq(self, consts.HANDLE_PICKLE, proto),)
@@ -230,9 +216,15 @@ class BaseNetref(with_metaclass(NetrefMetaclass, object)):
                 elif other.____id_pack__[2] != 0:
                     return True
             else:
+                # seems dubious if each netref proxies to a different address spaces
                 return syncreq(self, consts.HANDLE_INSTANCECHECK, other.____id_pack__)
         else:
-            return isinstance(other, self.__class__)
+            if self.____id_pack__[2] == 0:
+                # outside the context of `__instancecheck__`, `__class__` is expected to be type(self)
+                # within the context of `__instancecheck__`, `other` should be compared to the proxied class
+                return isinstance(other, type(self).__dict__['__class__'].instance)
+            else:
+                raise TypeError("isinstance() arg 2 must be a class, type, or tuple of classes and types")
 
 
 def _make_method(name, doc):
@@ -272,6 +264,33 @@ def _make_method(name, doc):
         return method
 
 
+class NetrefClass(object):
+    """a descriptor of the class being proxied
+
+    Future considerations:
+     + there may be a cleaner alternative but lib.compat.with_metaclass prevented using __new__
+     + consider using __slot__ for this class
+     + revisit the design choice to use properties here
+    """
+
+    def __init__(self, class_obj):
+        self._class_obj = class_obj
+
+    @property
+    def instance(self):
+        """accessor to class object for the instance being proxied"""
+        return self._class_obj
+
+    @property
+    def owner(self):
+        """accessor to the class object for the instance owner being proxied"""
+        return self._class_obj.__class__
+
+    def __get__(self, netref_instance, netref_owner):
+        """the value returned when accessing the netref class is dictated by whether or not an instance is proxied"""
+        return self.owner if netref_instance.____id_pack__[2] == 0 else self.instance
+
+
 def class_factory(id_pack, methods):
     """Creates a netref class proxying the given class
 
@@ -282,30 +301,35 @@ def class_factory(id_pack, methods):
     """
     ns = {"__slots__": (), "__class__": None}
     name_pack = id_pack[0]
-    if name_pack is not None:  # attempt to resolve against builtins and sys.modules
-        ns["__class__"] = _normalized_builtin_types.get(name_pack)
-        if ns["__class__"] is None:
+    class_descriptor = None
+    if name_pack is not None:
+        # attempt to resolve __class__ using normalized builtins first
+        _builtin_class = _normalized_builtin_types.get(name_pack)
+        if _builtin_class is not None:
+            class_descriptor = NetrefClass(_builtin_class)
+        # then by imported modules (this also tries all builtins under "builtins")
+        else:
             _module = None
-            didx = name_pack.rfind('.')
-            if didx != -1:
-                _module = sys.modules.get(name_pack[:didx])
-                if _module is not None:
-                    _module = getattr(_module, name_pack[didx + 1:], None)
-                else:
-                    _module = sys.modules.get(name_pack)
-            else:
-                _module = sys.modules.get(name_pack)
-            if _module:
-                if id_pack[2] == 0:
-                    ns["__class__"] = _module
-                else:
-                    ns["__class__"] = getattr(_module, "__class__", None)
-
+            cursor = len(name_pack)
+            while cursor != -1:
+                _module = sys.modules.get(name_pack[:cursor])
+                if _module is None:
+                    cursor = name_pack[:cursor].rfind('.')
+                    continue
+                _class_name = name_pack[cursor + 1:]
+                _class = getattr(_module, _class_name, None)
+                if _class is not None and hasattr(_class, '__class__'):
+                    class_descriptor = NetrefClass(_class)
+                break
+    ns['__class__'] = class_descriptor
+    netref_name = class_descriptor.owner.__name__ if class_descriptor is not None else name_pack
+    # create methods that must perform a syncreq
     for name, doc in methods:
         name = str(name)  # IronPython issue #10
+        # only create methods that wont shadow BaseNetref during merge for mro
         if name not in LOCAL_ATTRS:  # i.e. `name != __class__`
             ns[name] = _make_method(name, doc)
-    return type(name_pack, (BaseNetref,), ns)
+    return type(netref_name, (BaseNetref,), ns)
 
 
 for _builtin in _builtin_types:

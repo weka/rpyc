@@ -1,17 +1,18 @@
 import rpyc
 import os
 import unittest
-import nose
 from rpyc.utils.authenticators import SSLAuthenticator
 from rpyc.utils.server import ThreadedServer
 from rpyc import SlaveService
 
 try:
     import ssl  # noqa
+    _ssl_import_failed = False
 except ImportError:
-    raise nose.SkipTest("requires ssl")
+    _ssl_import_failed = True
 
 
+@unittest.skipIf(_ssl_import_failed, "Ssl not available")
 class Test_SSL(unittest.TestCase):
     '''
     created key like that
@@ -32,6 +33,8 @@ class Test_SSL(unittest.TestCase):
         self.server._start_in_thread()
 
     def tearDown(self):
+        while self.server.clients:
+            pass
         self.server.close()
 
     def test_ssl_conenction(self):

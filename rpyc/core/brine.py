@@ -1,6 +1,6 @@
 """*Brine* is a simple, fast and secure object serializer for **immutable** objects.
 
-The following types are supported: ``int``, ``long``, ``bool``, ``str``, ``float``,
+The following types are supported: ``int``, ``bool``, ``str``, ``float``,
 ``unicode``, ``bytes``, ``slice``, ``complex``, ``tuple`` (of simple types),
 ``frozenset`` (of simple types) as well as the following singletons: ``None``,
 ``NotImplemented``, and ``Ellipsis``.
@@ -17,7 +17,7 @@ Example::
  >>> x == z
  True
 """
-from rpyc.lib.compat import Struct, BytesIO, is_py3k, BYTES_LITERAL
+from rpyc.lib.compat import Struct, BytesIO, BYTES_LITERAL
 
 
 # singletons
@@ -30,7 +30,7 @@ TAG_NOT_IMPLEMENTED = b"\x05"
 TAG_ELLIPSIS = b"\x06"
 # types
 TAG_UNICODE = b"\x08"
-TAG_LONG = b"\x09"
+# deprecated w/ py2 support TAG_LONG = b"\x09"
 TAG_STR1 = b"\x0a"
 TAG_STR2 = b"\x0b"
 TAG_STR3 = b"\x0c"
@@ -49,15 +49,16 @@ TAG_FLOAT = b"\x18"
 TAG_SLICE = b"\x19"
 TAG_FSET = b"\x1a"
 TAG_COMPLEX = b"\x1b"
-if is_py3k:
-    IMM_INTS = dict((i, bytes([i + 0x50])) for i in range(-0x30, 0xa0))
-else:
-    IMM_INTS = dict((i, chr(i + 0x50)) for i in range(-0x30, 0xa0))
+IMM_INTS = dict((i, bytes([i + 0x50])) for i in range(-0x30, 0xa0))
 
-I1 = Struct("!B")
-I4 = Struct("!L")
-F8 = Struct("!d")
-C16 = Struct("!dd")
+# Below "!" is used to set byte order as network (= big-endian). See https://docs.python.org/3/library/struct.html
+F8 = Struct("!d")  # Python type float w/ size [8] (ctype double)
+C16 = Struct("!dd")  # Successive floats (complex numbers)
+I1 = Struct("!B")  # Python type int w/ size [1] (ctype unsigned char)
+I4 = Struct("!L")  # Python type int w/ size [4] (ctype unsigned long)
+# I4I4 is successive ints w/ size 4 and was introduced to pack local thread id and remote thread id
+# Since PyThread_get_thread_ident returns a type of unsigned long, !LL can store both thread IDs.
+I4I4 = Struct("!LL")
 
 _dump_registry = {}
 _load_registry = {}
@@ -69,6 +70,7 @@ def register(coll, key):
         coll[key] = func
         return func
     return deco
+
 
 # ===============================================================================
 # dumping
@@ -156,13 +158,6 @@ def _dump_str(obj, stream):
     _dump_bytes(obj.encode("utf8"), stream)
 
 
-if not is_py3k:
-    @register(_dump_registry, long)  # noqa: F821
-    def _dump_long(obj, stream):
-        stream.append(TAG_LONG)
-        _dump_int(obj, stream)
-
-
 @register(_dump_registry, tuple)
 def _dump_tuple(obj, stream):
     lenobj = len(obj)
@@ -185,11 +180,12 @@ def _dump_tuple(obj, stream):
 
 
 def _undumpable(obj, stream):
-    raise TypeError("cannot dump %r" % (obj,))
+    raise TypeError(f"cannot dump {obj}")
 
 
 def _dump(obj, stream):
     _dump_registry.get(type(obj), _undumpable)(obj, stream)
+
 
 # ===============================================================================
 # loading
@@ -227,18 +223,6 @@ def _load_empty_tuple(stream):
 @register(_load_registry, TAG_EMPTY_STR)
 def _load_empty_str(stream):
     return b""
-
-
-if is_py3k:
-    @register(_load_registry, TAG_LONG)
-    def _load_long(stream):
-        obj = _load(stream)
-        return int(obj)
-else:
-    @register(_load_registry, TAG_LONG)
-    def _load_long(stream):
-        obj = _load(stream)
-        return long(obj)  # noqa: F821
 
 
 @register(_load_registry, TAG_FLOAT)
@@ -316,16 +300,10 @@ def _load_tup_l1(stream):
     return tuple(_load(stream) for i in range(l))
 
 
-if is_py3k:
-    @register(_load_registry, TAG_TUP_L4)
-    def _load_tup_l4(stream):
-        l, = I4.unpack(stream.read(4))
-        return tuple(_load(stream) for i in range(l))
-else:
-    @register(_load_registry, TAG_TUP_L4)
-    def _load_tup_l4(stream):
-        l, = I4.unpack(stream.read(4))
-        return tuple(_load(stream) for i in xrange(l))  # noqa
+@register(_load_registry, TAG_TUP_L4)
+def _load_tup_l4(stream):
+    l, = I4.unpack(stream.read(4))
+    return tuple(_load(stream) for i in range(l))
 
 
 @register(_load_registry, TAG_SLICE)
@@ -385,12 +363,7 @@ def load(data):
     return _load(stream)
 
 
-if is_py3k:
-    simple_types = frozenset([type(None), int, bool, float, bytes, str, complex,
-                              type(NotImplemented), type(Ellipsis)])
-else:
-    simple_types = frozenset([type(None), int, long, bool, float, bytes, unicode, complex,  # noqa: F821
-                              type(NotImplemented), type(Ellipsis)])
+simple_types = frozenset([type(None), int, bool, float, bytes, str, complex, type(NotImplemented), type(Ellipsis)])
 
 
 def dumpable(obj):

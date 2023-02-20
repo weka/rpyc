@@ -6,17 +6,17 @@ Part 5: Asynchrounous Operation and Events
 Asynchronism
 ------------
 The last part of the tutorial deals with a more "advanced" issue of RPC programming,
-*asynchronous operation*, which is a key feature of RPyC. The code you've seen so far was
-*synchronous* -- which is probably very similar to the code you normally write:
-when you invoke a function, you block until the result arrives. Asynchronous invocation,
-on the other hand, allows you to start the request and continue, rather than waiting.
-Instead of getting the result of the call, you get a special object known as an
-``AsyncResult`` (also known as a `"future" or "promise" <http://en.wikipedia.org/wiki/Futures_and_promises>`_]),
+*asynchronous operation*, which is a key feature of RPyC. The code you have seen so far was
+*synchronous* -- which is similar to the code you often write:
+when you invoke a function, you block until the result arrives. Asynchronous invocation
+allows you to start the request and continue rather than waiting.
+Instead of getting the result of the call, you get an object known as an
+``AsyncResult`` (also known as a `"future" or "promise" <http://en.wikipedia.org/wiki/Futures_and_promises>`_)
 that will **eventually** hold the result.
 
 Note that there is no guarantee on execution order for async requests!
 
-In order to turn the invocation of a remote function (or any callable object) asynchronous,
+To turn the invocation of a remote function (or any callable object) asynchronous,
 all you have to do is wrap it with :func:`async_ <rpyc.utils.helpers.async_>`, which creates a
 wrapper function that will return an ``AsyncResult`` instead of blocking. ``AsyncResult``
 objects have several properties and methods that
@@ -31,7 +31,7 @@ objects have several properties and methods that
 
 * ``value`` - the value contained in the AsyncResult. If the value has not yet arrived,
   accessing this property will block. If the result is an exception, accessing this property
-  will raise it. If the object has expired, an exception will be raised. Otherwise, the
+  will raise it. If the object has expired, then an exception is raised. Otherwise, the
   value is returned
 
 * ``wait()`` - wait for the result to arrive, or until the object is expired
@@ -41,8 +41,8 @@ objects have several properties and methods that
 * ``set_expiry(seconds)`` - sets the expiry time of the AsyncResult. By default, no
   expiry time is set
 
-This may sound a bit complicated, so let's have a look at some real-life code, to convince you
-it's really not that scary::
+This may sound a bit complicated, so let us have a look at some real-life code, to convince you
+it is not that scary::
 
     >>> import rpyc
     >>> c=rpyc.classic.connect("localhost")
@@ -67,14 +67,14 @@ it's really not that scary::
     # ... after 15 seconds...
     >>> res.ready
     True
-    >>> print res.value
+    >>> print(res.value)
     None
     >>> res
     <AsyncResult object (ready) at 0x0842c6bc>
 
 And here's a more interesting snippet::
 
-    >>> aint = rpyc.async_(c.modules.__builtin__.int)  # async wrapper for the remote type int
+    >>> aint = rpyc.async_(c.builtins.int)  # async wrapper for the remote type int
 
     # a valid call
     >>> x = aint("8")
@@ -95,11 +95,18 @@ And here's a more interesting snippet::
     True
     >>> x.error
     True
-    >>> x.value #
+    >>> x.value
     Traceback (most recent call last):
     ...
-      File "/home/tomer/workspace/rpyc/core/async_.py", line 102, in value
+      File "/opt/rpyc/rpyc/core/async_.py", line 102, in value
         raise self._obj
+    ValueError: invalid literal for int() with base 10: 'this is not a valid number'
+
+    ========= Remote Traceback (1) =========
+    Traceback (most recent call last):
+      File "/opt/rpyc/rpyc/core/protocol.py", line 324, in _dispatch_request
+        res = self._HANDLERS[handler](self, *args)
+    ...
     ValueError: invalid literal for int() with base 10: 'this is not a valid number'
     >>>
 
@@ -121,7 +128,7 @@ consider the following ``FileMonitor`` example -- it monitors a file
     import time
     from threading import Thread
 
-    class FileMonitorService(rpyc.SlaveService):
+    class FileMonitorService(rpyc.Service):
         class exposed_FileMonitor(object):   # exposing names is not limited to methods :)
             def __init__(self, filename, callback, interval = 1):
                 self.filename = filename
@@ -150,41 +157,25 @@ consider the following ``FileMonitor`` example -- it monitors a file
 And here's a live demonstration of events::
 
     >>> import rpyc
-    >>>
-    >>> f = open("/tmp/floop.bloop", "w")
+    >>> f = open("/tmp/floop.bloop", "wb", buffering=0)
     >>> conn = rpyc.connect("localhost", 18871)
     >>> bgsrv = rpyc.BgServingThread(conn)  # creates a bg thread to process incoming events
     >>>
     >>> def on_file_changed(oldstat, newstat):
-    ...     print "file changed"
-    ...     print "    old stat: %s" % (oldstat,)
-    ...     print "    new stat: %s" % (newstat,)
+    ...     print("\nfile changed")
+    ...     print(f"    old stat: {oldstat}")
+    ...     print(f"    new stat: {newstat}")
     ...
-    >>> mon = conn.root.FileMonitor("/tmp/floop.bloop", on_file_changed) # create a filemon
+    >>> mon = conn.root.FileMonitor("/tmp/floop.bloop", on_file_changed)  # create a filemon
 
     # wait a little for the filemon to have a look at the original file
 
-    >>> f.write("shmoop") # change size
-    >>> f.flush()
-
-    # the other thread then prints
+    >>> f.write(b"oloop")  # change the file size and wait for filemon to notice the change
     file changed
         old stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 0L, 1225204483, 1225204483, 1225204483)
         new stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 6L, 1225204483, 1225204556, 1225204556)
 
-    >>>
-    >>> f.write("groop") # change size
-    >>> f.flush()
-    file changed
-        old stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 6L, 1225204483, 1225204556, 1225204556)
-        new stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 11L, 1225204483, 1225204566, 1225204566)
-
     >>> f.close()
-    >>> f = open(filename, "w")
-    file changed
-        old stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 11L, 1225204483, 1225204566, 1225204566)
-        new stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 0L, 1225204483, 1225204583, 1225204583)
-
     >>> mon.stop()
     >>> bgsrv.stop()
     >>> conn.close()
@@ -198,21 +189,16 @@ reactor and don't wish to open threads, you should be aware that these notificat
 not be processed until you make some interaction with the connection (which pulls all
 incoming requests). Here's an example of that::
 
-    >>> f = open("/tmp/floop.bloop", "w")
     >>> conn = rpyc.connect("localhost", 18871)
     >>> mon = conn.root.FileMonitor("/tmp/floop.bloop", on_file_changed)
-    >>>
+    >>> f.write(b"zloop")  # change the file size 
 
-    # change the size...
-    >>> f.write("shmoop")
-    >>> f.flush()
-
-    # ... seconds pass but nothing is printed ...
-    # until we make some interaction with the connection: printing a remote object invokes
-    # the remote __str__ of the object, so that all pending requests are suddenly processed
-    >>> print mon
+    # Notice that nothing is printed. To print the file change messages,
+    # the RPyC connection must serve requests from filemon that contain stat data.
+    # Dispatching a request would implicitly make the connection serve existing requests.
+    # Executing conn.poll_all() would explicitly serve all requests, without an extra dispatch.
+    >>> conn.poll_all()
     file changed
         old stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 0L, 1225205197, 1225205197, 1225205197)
         new stat: (33188, 1564681L, 2051L, 1, 1011, 1011, 6L, 1225205197, 1225205218, 1225205218)
-    <__main__.exposed_FileMonitor object at 0xb7a7a52c>
     >>>

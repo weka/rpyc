@@ -1,3 +1,3 @@
-version = (4, 1, 2)
-version_string = ".".join(map(str, version))
-release_date = "2019.10.03"
+__version__ = '5.3.0'
+version = tuple(__version__.split('.'))
+release_date = "2022-11-25"

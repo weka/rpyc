@@ -12,6 +12,9 @@ from rpyc.lib.compat import maxint  # noqa: F401
 import logging.handlers
 
 
+SPAWN_THREAD_PREFIX = 'RpycSpawnThread'
+
+
 class MissingModule(object):
     __slots__ = ["__name"]
 
@@ -20,8 +23,8 @@ class MissingModule(object):
 
     def __getattr__(self, name):
         if name.startswith("__"):  # issue 71
-            raise AttributeError("module %r not found" % (self.__name,))
-        raise ImportError("module %r not found" % (self.__name,))
+            raise AttributeError(f"module {self.__name!r} not found")
+        raise ImportError(f"module {self.__name!r} not found")
 
     def __bool__(self):
         return False
@@ -42,7 +45,7 @@ def safe_import(name):
     return mod
 
 
-def setup_logger(quiet=False, logfile=None):
+def setup_logger(quiet=False, logfile=None, namespace=None):
     log_format = "%(asctime)s|%(threadName)-25s|%(name)-30s|%(levelname)-5s|%(funcName)-30s |%(message)s"
     log_level = logging.ERROR if quiet else logging.DEBUG
     logging.basicConfig(format=log_format, level=log_level)
@@ -69,10 +72,21 @@ class hybridmethod(object):
         raise AttributeError("Cannot overwrite method")
 
 
+def hasattr_static(obj, attr):
+    """Returns if `inspect.getattr_static` can find an attribute of ``obj``."""
+    try:
+        inspect.getattr_static(obj, attr)
+    except AttributeError:
+        return False
+    else:
+        return True
+
+
 def spawn(*args, **kwargs):
     """Start and return daemon thread. ``spawn(func, *args, **kwargs)``."""
     func, args = args[0], args[1:]
-    thread = threading.Thread(target=func, args=args, kwargs=kwargs)
+    str_id_pack = '-'.join([f'{i}' for i in get_id_pack(func)])
+    thread = threading.Thread(name=f'{SPAWN_THREAD_PREFIX}-{str_id_pack}', target=func, args=args, kwargs=kwargs)
     thread.daemon = True
     thread.start()
     return thread
@@ -98,7 +112,7 @@ def spawn_waitready(init, main):
     return thread, stack.pop()
 
 
-class Timeout:
+class Timeout(object):
 
     def __init__(self, timeout):
         if isinstance(timeout, Timeout):
@@ -153,12 +167,41 @@ def exp_backoff(collision):
 
 
 def get_id_pack(obj):
-    """introspects the given (local) object, returns id_pack as expected by BaseNetref"""
-    if not inspect.isclass(obj):
+    """introspects the given "local" object, returns id_pack as expected by BaseNetref
+
+    The given object is "local" in the sense that it is from the local cache. Any object in the local cache exists
+    in the current address space or is a netref. A netref in the local cache could be from a chained-connection.
+    To handle type related behavior properly, the attribute `__class__` is a descriptor for netrefs.
+
+    So, check thy assumptions regarding the given object when creating `id_pack`.
+    """
+    if hasattr(obj, '____id_pack__'):
+        # netrefs are handled first since __class__ is a descriptor
+        return obj.____id_pack__
+    elif inspect.ismodule(obj) or getattr(obj, '__name__', None) == 'module':
+        # TODO: not sure about this, need to enumerate cases in units
+        if isinstance(obj, type):  # module
+            obj_cls = type(obj)
+            name_pack = '{0}.{1}'.format(obj_cls.__module__, obj_cls.__name__)
+            return (name_pack, id(type(obj)), id(obj))
+        else:
+            if inspect.ismodule(obj) and obj.__name__ != 'module':
+                if obj.__name__ in sys.modules:
+                    name_pack = obj.__name__
+                else:
+                    name_pack = '{0}.{1}'.format(obj.__class__.__module__, obj.__name__)
+            elif inspect.ismodule(obj):
+                name_pack = '{0}.{1}'.format(obj.__module__, obj.__name__)
+                print(name_pack)
+            elif hasattr(obj, '__module__'):
+                name_pack = '{0}.{1}'.format(obj.__module__, obj.__name__)
+            else:
+                obj_cls = type(obj)
+                name_pack = '{0}'.format(obj.__name__)
+            return (name_pack, id(type(obj)), id(obj))
+    elif not inspect.isclass(obj):
         name_pack = '{0}.{1}'.format(obj.__class__.__module__, obj.__class__.__name__)
         return (name_pack, id(type(obj)), id(obj))
-    elif hasattr(obj, '____id_pack__'):
-        return obj.____id_pack__
     else:
         name_pack = '{0}.{1}'.format(obj.__module__, obj.__name__)
         return (name_pack, id(obj), 0)

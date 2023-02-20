@@ -1,3 +1,156 @@
+5.3.0
+=====
+Date: 2022-11-25
+
+- `#515`_ Support for Python 3.11 is available after teleportation bug fix
+- `#507`_ Experimental support for threading is added (default is disabled for now)
+- `#516`_ Resolved server-side exceptions due to the logic for checking if a name is in `ModuleNamespace`
+- `#511`_ Improved documentation on the life-cycle of a netref/proxy-object
+
+.. _#515: https://github.com/tomerfiliba-org/rpyc/pull/515
+.. _#507: https://github.com/tomerfiliba-org/rpyc/pull/507
+.. _#516: https://github.com/tomerfiliba-org/rpyc/issues/516
+.. _#515: https://github.com/tomerfiliba-org/rpyc/pull/515
+.. _#511: https://github.com/tomerfiliba-org/rpyc/issues/511
+
+5.2.3
+=====
+Date: 2022-08-03
+
+- `#503`_ `rpyc_classic.py` and `rpyc_registry.py` can now be resolved without the suffix as well.
+
+.. _#503: https://github.com/tomerfiliba-org/rpyc/issues/503
+
+5.2.1
+=====
+Date: 2022-07-30
+
+- `#494`_ Added support for using decorators to expose methods (see `#292`_)
+- `#499`_ Allow `BgServingThread` serve and sleep intervals to be customized
+- `#498`_ Avoid redefining `hasattr_static` on every `_check_attr` call
+- `#489`_ Updated SSL context usage to avoid deprecated aspects and changes
+- `#485`_ Add a configurable timeout on the zero deploy close method
+- `#484`_ Fixed `--mode` CLI argument for `rpyc_registry`
+- `#479`_ Fixed propagation of `AttributeErrors` raised by exposed descriptors
+- `#476`_ Allow filtering by host on list_services
+- `#493`_ and `#502`_  Improved documentation and fixed typos
+- `#492`_ Some work around race conditions but proper fix is rather involved (see `#491`_)
+
+.. _#502: https://github.com/tomerfiliba-org/rpyc/pull/502
+.. _#499: https://github.com/tomerfiliba-org/rpyc/pull/499
+.. _#498: https://github.com/tomerfiliba-org/rpyc/pull/498
+.. _#494: https://github.com/tomerfiliba-org/rpyc/pull/494
+.. _#489: https://github.com/tomerfiliba-org/rpyc/pull/489
+.. _#485: https://github.com/tomerfiliba-org/rpyc/pull/485
+.. _#484: https://github.com/tomerfiliba-org/rpyc/pull/484
+.. _#479: https://github.com/tomerfiliba-org/rpyc/pull/479
+.. _#476: https://github.com/tomerfiliba-org/rpyc/pull/476
+.. _#492: https://github.com/tomerfiliba-org/rpyc/pull/492
+.. _#493: https://github.com/tomerfiliba-org/rpyc/issues/493
+.. _#491: https://github.com/tomerfiliba-org/rpyc/issues/491
+.. _#307: https://github.com/tomerfiliba-org/rpyc/issues/307
+.. _#292: https://github.com/tomerfiliba-org/rpyc/issues/292
+
+* 5.2.0 was skipped due to PyPi not allowing file name reuse
+
+5.1.0
+=====
+Date: 2022-02-26
+
+- Add `types.MappingProxyType` to `_builtin_types` `#470`_
+- Updated documentation `#469`_
+- Fixed spradic dealock issues from wait within AsyncResult `#463`_ and `#455`_
+- Fixed chained Classic RPyC connections `#460`_
+- Added ability to list Registry services `#452`_
+- Fixed bug that prevented RPyC from running on systems without SSL `#451`_
+- Fixed unexpected behavior with respect to `auto_register` `#445`_
+- Fixed propagation of `chunk_size` parameter for `download_dir` `#433`_
+
+.. _#470: https://github.com/tomerfiliba-org/rpyc/pull/470
+.. _#469: https://github.com/tomerfiliba-org/rpyc/pull/469
+.. _#463: https://github.com/tomerfiliba-org/rpyc/pull/463
+.. _#460: https://github.com/tomerfiliba-org/rpyc/pull/460
+.. _#455: https://github.com/tomerfiliba-org/rpyc/pull/455
+.. _#452: https://github.com/tomerfiliba-org/rpyc/pull/452
+.. _#451: https://github.com/tomerfiliba-org/rpyc/pull/451
+.. _#445: https://github.com/tomerfiliba-org/rpyc/pull/445
+.. _#433: https://github.com/tomerfiliba-org/rpyc/pull/433
+
+
+5.0.1
+-----
+Date: 1.11.2021
+
+- Fixed unexpected behavior when using inspect.isfunction `#426`_
+- Now prevents installation of RPyC on unsupported versions of python `#429`_
+
+.. _#426: https://github.com/tomerfiliba/rpyc/issues/426
+.. _#429: https://github.com/tomerfiliba/rpyc/pull/429
+
+5.0.0
+-----
+Date: 12.26.2020
+
+Backwards Incompatible
+^^^^^^^^^^^^^^^^^^^^^^
+- RPyC 5.0.0 cannot teleport functions to earlier versions
+- Deprecated Python 2 support to coincide with it's EOL
+
+Improvements
+^^^^^^^^^^^^
+- Server hostname default supports IPv4 and IPv6 by using the wildcard address `#425`_
+- Added ``docker/docker-compose.yml`` for Python 3.6, 3.7, 3.8, 3.9, and 3.10 containers to improve local workflow
+- Fixed pickle failure on windows for ``connect_multiprocess`` and ``connect_thread`` `#412`_
+- Fixed teleport function behavior for keyword-only arguments with default `#422`_
+- Improved documentation on custom exception handling
+- Fixed IPv6 support for server `#407`_
+- Added a simple asynchrounous service example `#400`_
+
+.. _#425: https://github.com/tomerfiliba-org/rpyc/issues/425
+.. _#412: https://github.com/tomerfiliba-org/rpyc/pull/412
+.. _#422: https://github.com/tomerfiliba-org/rpyc/pull/422
+.. _#407: https://github.com/tomerfiliba-org/rpyc/issues/407
+.. _#400: https://github.com/tomerfiliba-org/rpyc/pull/400
+
+4.1.5
+-----
+Date: 4.25.2020
+
+- Fixed mutable object used as kwarg for Server ctor `#376`_
+- Corrections to teleport example `#374`_
+- Lowered GIL-lock acquires for <64kb within channel sends to address slowness `#280`_
+
+.. _#376: https://github.com/tomerfiliba/rpyc/pull/376
+.. _#374: https://github.com/tomerfiliba/rpyc/pull/374
+.. _#280: https://github.com/tomerfiliba/rpyc/issues/280
+
+4.1.4
+-----
+Date: 1.30.2020
+
+- Merged 3.7 and 3.8 teleportatio compat enhancement `#371`_
+- Fixed connection hanging due to namepack cursor  `#369`_
+- Fixed test dependencies and is_py_* for 3.9
+
+.. _#371: https://github.com/tomerfiliba/rpyc/issues/371
+.. _#369: https://github.com/tomerfiliba/rpyc/issues/369
+
+4.1.3
+-----
+Date: 1.25.2020
+
+- Performance improvements: `#366`_ and `#351`_
+- Merged fix for propagate_KeyboardInterrupt_locally `#364`_
+- Fixed handling of exceptions for request callbacks `#365`_
+- Partially fixed return value for netref.__class__ `#355`_
+
+.. _#366: https://github.com/tomerfiliba/rpyc/issues/366
+.. _#351: https://github.com/tomerfiliba/rpyc/pull/351
+.. _#364: https://github.com/tomerfiliba/rpyc/pull/364
+.. _#365: https://github.com/tomerfiliba/rpyc/issues/365
+.. _#355: https://github.com/tomerfiliba/rpyc/issues/355
+
+
 4.1.2
 -----
 Date: 10.03.2019

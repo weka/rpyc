@@ -37,19 +37,9 @@ class ClassicMode(unittest.TestCase):
         self.assertEqual(list(bi), list(range(10000)))
 
     def test_classic(self):
-        print(self.conn.modules.sys)
-        print(self.conn.modules["xml.dom.minidom"].parseString("<a/>"))
         self.conn.execute("x = 5")
         self.assertEqual(self.conn.namespace["x"], 5)
         self.assertEqual(self.conn.eval("1+x"), 6)
-
-    def test_isinstance(self):
-        x = self.conn.builtin.list((1, 2, 3, 4))
-        print(self.conn.builtin.list, type(self.conn.builtin.list))  # <class 'list'> <netref class 'builtins.type'>
-        print(x, type(x))  # [1, 2, 3, 4] <netref class 'builtins.list'>
-        print(x.__class__, type(x.__class__))  # <class 'list'> <class 'type'>
-        self.assertTrue(isinstance(x, list))
-        self.assertTrue(isinstance(x, rpyc.BaseNetref))
 
     def test_mock_connection(self):
         from rpyc.utils.classic import MockClassicConnection
@@ -60,6 +50,11 @@ class ClassicMode(unittest.TestCase):
         self.assertTrue(conn.modules["xml.dom.minidom"].Element is xml.dom.minidom.Element)
         self.assertTrue(conn.builtin.open is open)
         self.assertEqual(conn.eval("2+3"), 5)
+
+    def test_modules(self):
+        self.assertIn('test_magic', self.conn.modules)
+        self.assertNotIn('test_badmagic', self.conn.modules)
+        self.assertIsNone(self.conn.builtins.locals()['self']._last_traceback)
 
 
 if __name__ == "__main__":
